@@ -1,0 +1,14 @@
+-- Whether an account-wide campaign may message the same person again when they
+-- comment on a different post.
+--
+-- The claim was keyed on (campaign, commenter) with no post in it, so a single
+-- campaign watching the whole account messaged a repeat commenter once and then
+-- went quiet: someone who asked on two posts got less than someone who asked on
+-- one. The old behaviour wasn't even self-consistent — two campaigns pinned to
+-- two posts already sent twice, because those are two campaign ids, so whether a
+-- second post got answered depended on how the campaigns happened to be split
+-- rather than on anything anyone chose.
+--
+-- Post-specific campaigns are unaffected by this column either way: their id
+-- already implies the post, so both settings produce the same key.
+ALTER TABLE campaigns ADD COLUMN dedupe_scope TEXT NOT NULL DEFAULT 'per_post';

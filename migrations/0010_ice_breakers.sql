@@ -1,0 +1,14 @@
+-- The question this campaign contributes to the account's Ice Breakers: the
+-- tappable prompts Instagram shows when someone opens a DM with the account for
+-- the first time, which is what a new follower does when they hit Message.
+--
+-- This is the nearest supported thing to messaging someone the moment they
+-- follow. Meta has no follow webhook and no endpoint that names your followers,
+-- so a follow itself is invisible to us; a tap is not, and it opens the 24-hour
+-- window the same way a story reply does.
+--
+-- NULL means this campaign contributes nothing. Meta caps the account at four,
+-- and they live on Meta's servers rather than here — the dashboard's publish
+-- action is what pushes the current set, so editing this column alone changes
+-- nothing until it's published.
+ALTER TABLE campaigns ADD COLUMN ice_breaker TEXT;

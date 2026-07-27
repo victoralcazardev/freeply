@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A second push to the same branch makes the first run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: typecheck + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Fails the build on any tsc error. A type that doesn't hold is a Worker
+      # that throws at 3am, not a lint warning.
+      - run: npm run typecheck
+
+      # Runs against workerd, real D1 and a real Durable Object via
+      # @cloudflare/vitest-pool-workers. No network and no secrets: the bindings
+      # in vitest.config.ts are fixtures, and .dev.vars is never committed.
+      - run: npm test

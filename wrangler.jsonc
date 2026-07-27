@@ -1,0 +1,54 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "freeply",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  // account_id is read from the CLOUDFLARE_ACCOUNT_ID env var so this file is safe
+  // to publish. Set it before deploying: export CLOUDFLARE_ACCOUNT_ID=...
+  // Serves on the free <worker>.<your-subdomain>.workers.dev hostname, so deploying
+  // needs no domain of your own. That hostname works as the Meta webhook callback,
+  // the OAuth redirect, and the tracked-link host.
+  "workers_dev": true,
+  // Optional. Uncomment and point at a hostname on a Cloudflare zone you control to
+  // serve from your own domain — worth it for tracked links, since a workers.dev URL
+  // in a DM looks like a URL shortener. Leave it commented to stay domain-free.
+  // "routes": [{ "pattern": "freeply.example.com", "custom_domain": true }],
+  "vars": {
+    // Shown as the contact address on /privacy and /data-deletion. `npm run setup`
+    // writes your OPERATOR_EMAIL from .dev.vars into this line — don't edit it by
+    // hand, and don't commit the result.
+    "OPERATOR_EMAIL": "you@example.com",
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "freeply",
+      // Yours, not the author's. `npm run setup` creates the database on first run
+      // and writes its id here. The edit is expected to stay local: it identifies
+      // your Cloudflare resource, so leave it out of any commit or pull request.
+      "database_id": "SET_BY_NPM_RUN_SETUP",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "ACCOUNT", "class_name": "AccountDO" }]
+  },
+  // Both jobs fail silently if nobody runs them — see src/cron.ts. Cron Triggers
+  // are on the Cloudflare free plan; the free-plan cap is 5 per account, so these
+  // two leave room. Times are UTC.
+  "triggers": {
+    "crons": [
+      // Token refresh. Daily is enough: refreshes start 7 days before expiry, so
+      // a failed run has six more chances before the account actually lapses.
+      // Off the hour deliberately — the top of the hour is the busiest slot.
+      "7 4 * * *",
+      // Missed-webhook reconciliation. A dropped delivery is a lead that expires
+      // when the 7-day private-reply window closes, not one that waits.
+      "*/15 * * * *"
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountDO"] }],
+  "observability": {
+    "enabled": true
+  }
+}

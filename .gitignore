@@ -1,0 +1,37 @@
+# Secrets — never commit
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+*.pem
+
+# Dependencies
+node_modules/
+
+# Wrangler local state (contains local D1/DO/KV data and cached credentials)
+.wrangler/
+
+# Build output
+dist/
+.output/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Working notes — architecture, priorities, the competitive read, and an unbuilt
+# delivery mode. Kept local: the roadmap names unshipped weaknesses, the comparison
+# names another project, and TWO-STEP describes an account observed in the wild.
+PLAN.md
+ROADMAP.md
+COMPARISON.md
+TWO-STEP.md
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

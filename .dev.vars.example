@@ -1,0 +1,43 @@
+# Copy to .dev.vars and fill in — or run `npm run init`, which creates the file and
+# generates the three random values below for you.
+#
+# .dev.vars is gitignored and is the single source of truth: `npm run setup` reads
+# it, validates it, and pushes each value to Cloudflare as an encrypted secret.
+# Never commit real values.
+
+# ---- Required ----
+
+# From the Instagram product → "API setup with Instagram login" panel.
+# NOT the pair in App settings → Basic; this panel has its own, and they are the
+# ones that matter. The Instagram app ID is the OAuth client_id for Business Login,
+# and the Instagram app secret is what Meta signs webhooks with.
+INSTAGRAM_APP_ID="your-instagram-app-id"
+INSTAGRAM_APP_SECRET="your-instagram-app-secret"
+
+# Any random string; must match what you paste into the Meta dashboard when you
+# set the webhook callback. Generate with: openssl rand -hex 24
+META_VERIFY_TOKEN="a-random-string-you-also-paste-into-the-meta-dashboard"
+
+# Encrypts Instagram tokens at rest in D1. Generate: openssl rand -hex 32
+# Changing this orphans every stored token.
+ENCRYPTION_KEY="generate-me"
+
+# Password for the dashboard at /. Generate: openssl rand -hex 12
+DASHBOARD_PASSWORD="choose-me"
+
+# Your contact address, shown on the /privacy and /data-deletion pages Meta requires.
+# `npm run setup` copies it into wrangler.jsonc; it is not a secret.
+OPERATOR_EMAIL="you@example.com"
+
+# ---- Optional ----
+
+# Only needed if your login has access to more than one Cloudflare account, or if
+# CLOUDFLARE_ACCOUNT_ID isn't already in your environment. It's on the right-hand
+# side of the Cloudflare dashboard overview page.
+CLOUDFLARE_ACCOUNT_ID=""
+
+# From App settings → Basic. Nothing in src/ reads these — Instagram Business Login
+# runs entirely on the Instagram pair above — so setup won't block on them. They're
+# here for a Facebook-login flow this project doesn't have yet.
+META_APP_ID=""
+META_APP_SECRET=""

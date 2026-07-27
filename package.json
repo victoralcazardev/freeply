@@ -1,0 +1,29 @@
+{
+  "name": "freeply",
+  "version": "1.0.0",
+  "description": "Self-hosted Instagram comment-to-DM automation on Cloudflare's free tier",
+  "license": "MIT",
+  "repository": "github:chris-jk/freeply-many-chat",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "wrangler d1 migrations apply freeply --local && wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "init": "bash scripts/init-vars.sh",
+    "setup": "bash scripts/setup.sh"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.8",
+    "@cloudflare/workers-types": "^5.20260722.1",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.78.0"
+  }
+}

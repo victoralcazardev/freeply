@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+#
+# One command from a fresh clone to a live Worker:
+#
+#   1. validates .dev.vars against the example, so no placeholder reaches Cloudflare
+#   2. creates your D1 database if it doesn't exist, and writes its id into wrangler.jsonc
+#   3. applies every migration to that database
+#   4. deploys the Worker
+#   5. pushes each secret from .dev.vars
+#   6. prints the webhook URL and verify token you paste into Meta
+#
+# .dev.vars is gitignored and is the single local source of truth. Fill it in
+# (see .dev.vars.example), then run: npm run setup
+#
+# Safe to re-run — every step checks the current state first.
+#
+# Values are never echoed — only names and lengths — so this is safe to run in a
+# shared terminal or with an agent watching.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+VARS_FILE=".dev.vars"
+EXAMPLE_FILE=".dev.vars.example"
+CONFIG_FILE="wrangler.jsonc"
+DB_NAME="freeply"
+
+# Pushed to Cloudflare as encrypted secrets, and setup stops without them.
+REQUIRED=(INSTAGRAM_APP_ID INSTAGRAM_APP_SECRET
+          META_VERIFY_TOKEN ENCRYPTION_KEY DASHBOARD_PASSWORD)
+
+# Pushed if present, ignored if not. Nothing in src/ reads either one — Instagram
+# Business Login runs entirely on the Instagram pair — so blocking setup on them
+# would gate a working install on two values that do nothing. Kept because they're
+# what a Facebook-login flow would need if this ever grows one.
+OPTIONAL=(META_APP_ID META_APP_SECRET)
+
+# Needed, but not a secret — it's a plain var in wrangler.jsonc, shown on /privacy.
+CONFIG_VARS=(OPERATOR_EMAIL)
+
+if [[ ! -f "$VARS_FILE" ]]; then
+  echo "error: $VARS_FILE not found. Create it with:" >&2
+  echo "  npm run init" >&2
+  echo "It generates the three values you shouldn't have to invent and leaves the" >&2
+  echo "Meta credentials for you to paste in." >&2
+  exit 1
+fi
+
+# Read KEY="value" / KEY=value from a file without sourcing it.
+read_from() {
+  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" \
+    | head -1 | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+
+read_var() { read_from "$VARS_FILE" "$1"; }
+
+# A value is a placeholder if it's empty, if it still matches what the example file
+# ships for that key, or if it looks like something left over from local testing.
+# Comparing against the example is what catches "generate-me" and "choose-me" —
+# those are real strings that would otherwise sail through and encrypt every stored
+# Instagram token under a password that is published in this repo.
+is_placeholder() {
+  local name="$1" value="$2" example
+  [[ -z "$value" ]] && return 0
+  if [[ -f "$EXAMPLE_FILE" ]]; then
+    example="$(read_from "$EXAMPLE_FILE" "$name")"
+    [[ -n "$example" && "$value" == "$example" ]] && return 0
+  fi
+  case "$value" in
+    your-*|a-random-string-*|test_*|changeme|CHANGEME|generate-me|choose-me) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+echo "checking $VARS_FILE"
+missing=0
+for name in "${REQUIRED[@]}" "${CONFIG_VARS[@]}"; do
+  value="$(read_var "$name")"
+  if is_placeholder "$name" "$value"; then
+    echo "  MISSING  $name is empty or still the example value"
+    missing=1
+  else
+    echo "  ok       $name (${#value} chars)"
+  fi
+done
+
+if [[ "$missing" -eq 1 ]]; then
+  echo >&2
+  echo "Fill in the values marked MISSING above in $VARS_FILE, then re-run." >&2
+  echo >&2
+  echo "  META_VERIFY_TOKEN, ENCRYPTION_KEY, DASHBOARD_PASSWORD  ->  npm run init" >&2
+  echo "  INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET                 ->  Meta app dashboard," >&2
+  echo "                                                             Instagram product ->" >&2
+  echo "                                                             API setup with" >&2
+  echo "                                                             Instagram login" >&2
+  echo "  OPERATOR_EMAIL                                         ->  your contact address," >&2
+  echo "                                                             shown on /privacy" >&2
+  exit 1
+fi
+
+if [[ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+  account_id="$(read_var CLOUDFLARE_ACCOUNT_ID)"
+  if [[ -n "$account_id" ]]; then
+    export CLOUDFLARE_ACCOUNT_ID="$account_id"
+  fi
+fi
+
+echo
+echo "checking Cloudflare login"
+if ! npx wrangler whoami >/dev/null 2>&1; then
+  echo "  not logged in" >&2
+  echo >&2
+  echo "Run this once, then re-run npm run setup:" >&2
+  echo "  npx wrangler login" >&2
+  exit 1
+fi
+echo "  ok       authenticated"
+
+# Rewrite one "key": "value" pair in wrangler.jsonc, in place. Both keys appear
+# exactly once, and a temp file keeps this working on BSD and GNU sed alike.
+jsonc_set() {
+  local key="$1" value="$2" escaped tmp
+  # In sed's replacement, & means "everything that matched" and \ and the | delimiter
+  # are structural. An email containing & is legal and would otherwise splice the
+  # matched text back into the file and corrupt the config.
+  escaped="$(printf '%s' "$value" | sed -e 's/[\\&|]/\\&/g')"
+  tmp="$(mktemp)"
+  sed "s|\(\"$key\"[[:space:]]*:[[:space:]]*\"\)[^\"]*\(\"\)|\1$escaped\2|" \
+    "$CONFIG_FILE" >"$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+echo
+echo "checking D1 database"
+current_id="$(sed -n 's/.*"database_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$CONFIG_FILE" | head -1)"
+
+# The id of the database named freeply on this account, if there is one. Asking
+# Cloudflare rather than trusting the config is what makes a fresh fork work: the
+# id committed to the repo belongs to nobody's account but the author's.
+db_id="$(npx wrangler d1 list --json 2>/dev/null \
+  | node -e '
+      let raw = "";
+      process.stdin.on("data", (c) => (raw += c));
+      process.stdin.on("end", () => {
+        try {
+          const found = JSON.parse(raw).find((d) => d.name === process.argv[1]);
+          process.stdout.write(found ? found.uuid : "");
+        } catch {
+          process.stdout.write("");
+        }
+      });
+    ' "$DB_NAME" || true)"
+
+if [[ -z "$db_id" ]]; then
+  echo "  creating database \"$DB_NAME\""
+  npx wrangler d1 create "$DB_NAME" >/dev/null
+  db_id="$(npx wrangler d1 list --json 2>/dev/null \
+    | node -e '
+        let raw = "";
+        process.stdin.on("data", (c) => (raw += c));
+        process.stdin.on("end", () => {
+          try {
+            const found = JSON.parse(raw).find((d) => d.name === process.argv[1]);
+            process.stdout.write(found ? found.uuid : "");
+          } catch {
+            process.stdout.write("");
+          }
+        });
+      ' "$DB_NAME" || true)"
+fi
+
+if [[ -z "$db_id" ]]; then
+  echo >&2
+  echo "error: couldn't create or find a D1 database named \"$DB_NAME\"." >&2
+  echo >&2
+  echo "The usual cause is a login with access to more than one Cloudflare account," >&2
+  echo "which wrangler can't choose between on its own. Add the account id to" >&2
+  echo "$VARS_FILE and re-run:" >&2
+  echo "  CLOUDFLARE_ACCOUNT_ID=\"...\"" >&2
+  echo >&2
+  echo "Otherwise, create the database by hand and re-run — setup will find it:" >&2
+  echo "  npx wrangler d1 create $DB_NAME" >&2
+  exit 1
+fi
+
+if [[ "$current_id" != "$db_id" ]]; then
+  jsonc_set "database_id" "$db_id"
+  echo "  wrote    database_id into $CONFIG_FILE (local edit — don't commit it)"
+else
+  echo "  ok       database_id already matches"
+fi
+
+# Same treatment for the contact address. Keeping it in .dev.vars means there is one
+# file to fill in, and no chance of publishing a privacy page carrying someone else's
+# email because it was left in a config that ships with the repo.
+operator_email="$(read_var OPERATOR_EMAIL)"
+jsonc_set "OPERATOR_EMAIL" "$operator_email"
+echo "  wrote    OPERATOR_EMAIL into $CONFIG_FILE (local edit — don't commit it)"
+
+echo
+echo "applying migrations"
+# Runs before the deploy on purpose: a Worker that goes live against a database with
+# no tables 500s on its own dashboard, and the first thing you'd do is read the logs
+# rather than suspect the schema.
+npx wrangler d1 migrations apply "$DB_NAME" --remote
+
+echo
+echo "deploying worker"
+# Captured as well as shown: without a custom domain the hostname is assigned by
+# Cloudflare, so the only place to learn it is wrangler's own output.
+deploy_log="$(mktemp)"
+trap 'rm -f "$deploy_log"' EXIT
+
+# Two wrangler failures here are common, land after the database already exists,
+# and read as platform bugs rather than things you can fix. Both get translated.
+if ! npx wrangler deploy 2>&1 | tee "$deploy_log"; then
+  echo >&2
+  if grep -qiE "subdomain" "$deploy_log"; then
+    echo "This account has no workers.dev subdomain yet, and one is needed to serve" >&2
+    echo "on the free hostname. Register it once at:" >&2
+    echo "  https://dash.cloudflare.com  ->  Compute (Workers & Pages)" >&2
+    echo "then re-run npm run setup." >&2
+  elif grep -qiE "more than one account|account_id" "$deploy_log"; then
+    echo "Your login has access to more than one Cloudflare account, so wrangler" >&2
+    echo "can't pick one on its own. Add the account id to $VARS_FILE:" >&2
+    echo "  CLOUDFLARE_ACCOUNT_ID=\"...\"" >&2
+    echo "It's on the right-hand side of your Cloudflare dashboard overview page." >&2
+  else
+    echo "The deploy failed — the error above is wrangler's own." >&2
+  fi
+  echo >&2
+  echo "The D1 database and its migrations are already in place, so re-running" >&2
+  echo "npm run setup after fixing this picks up where it stopped." >&2
+  exit 1
+fi
+
+echo
+echo "pushing secrets"
+secret_log="$(mktemp)"
+trap 'rm -f "$deploy_log" "$secret_log"' EXIT
+for name in "${REQUIRED[@]}" "${OPTIONAL[@]}"; do
+  value="$(read_var "$name")"
+
+  # An optional value nobody filled in is skipped rather than uploaded empty.
+  if is_placeholder "$name" "$value"; then
+    echo "  skipped  $name (optional, not set)"
+    continue
+  fi
+
+  # stdout is discarded because wrangler echoes the value's destination, but stderr
+  # is kept: a secret that fails to upload leaves a deployed Worker that 500s on its
+  # own dashboard, and swallowing the reason makes that unexplainable.
+  if printf '%s' "$value" | npx wrangler secret put "$name" >/dev/null 2>"$secret_log"; then
+    echo "  set      $name"
+  else
+    echo "  FAILED   $name" >&2
+    sed 's/^/           /' "$secret_log" >&2
+    echo >&2
+    echo "The Worker is deployed but incompletely configured. Fix the error above" >&2
+    echo "and re-run npm run setup — it is safe to repeat." >&2
+    exit 1
+  fi
+done
+
+# A custom domain wins if one is configured. Commented-out routes don't count —
+# the example route in wrangler.jsonc would otherwise be reported as your hostname.
+host="$(grep -v '^[[:space:]]*//' "$CONFIG_FILE" \
+  | sed -n 's/.*"pattern"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
+
+if [[ -z "$host" ]]; then
+  host="$(grep -oE '[A-Za-z0-9._-]+\.workers\.dev' "$deploy_log" | head -1 || true)"
+fi
+
+if [[ -z "$host" ]]; then
+  echo >&2
+  echo "warning: couldn't determine the deployed hostname. Read it from the deploy" >&2
+  echo "output above and use it wherever YOUR-HOSTNAME appears in the README." >&2
+  host="YOUR-HOSTNAME"
+fi
+
+echo
+echo "done."
+echo
+echo "  dashboard     https://${host}/"
+echo "  webhook URL   https://${host}/webhook"
+echo "  verify token  the META_VERIFY_TOKEN value in $VARS_FILE"
+echo
+echo "Next: paste the webhook URL and verify token into the Meta dashboard, subscribe"
+echo "to the 'comments' field, then switch the app from Development to Live — real"
+echo "comments never arrive until you do. Watch them land with: npm run tail"

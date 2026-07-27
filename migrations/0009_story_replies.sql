@@ -1,0 +1,13 @@
+-- Whether a campaign also answers replies to the account's stories.
+--
+-- A story reply is not a comment and not a private reply. It arrives on the
+-- `messages` webhook as an ordinary inbound DM, which means the 24-hour window
+-- is already open when we see it: no one-shot limit, no 7-day deadline, and no
+-- private reply spent. The constraint that shapes the comment path doesn't apply
+-- here at all.
+--
+-- Off by default. Turning it on for an existing campaign is a decision about who
+-- gets messaged, and a migration is the wrong place to make it for you. Only
+-- meaningful on an account-wide campaign — a campaign pinned to a post is asking
+-- about that post, and a story isn't it.
+ALTER TABLE campaigns ADD COLUMN story_replies INTEGER NOT NULL DEFAULT 0;
