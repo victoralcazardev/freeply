@@ -33,9 +33,23 @@
   "durable_objects": {
     "bindings": [{ "name": "ACCOUNT", "class_name": "AccountDO" }]
   },
+  // Reels and renders for the cash.builds workspace, served by /files (src/files.ts).
+  // A Worker can't ship a 6MB mp4 in its own bundle, so the video lives here.
+  // NOTE: the bucket does not exist yet — `wrangler r2 bucket create cashbuilds-media`
+  // has to run once before a deploy with this binding will succeed.
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "cashbuilds-media" }],
   // Both jobs fail silently if nobody runs them — see src/cron.ts. Cron Triggers
   // are on the Cloudflare free plan; the free-plan cap is 5 per account, so these
   // two leave room. Times are UTC.
+  // A second custom domain can serve the same worker — the workspace page under
+  // its own hostname, say — and tracked links follow whichever host answered, so
+  // retiring one after DMs have gone out breaks the links already delivered.
+  // Keep an old hostname attached rather than 404ing real inboxes.
+  // "routes": [
+  //   { "pattern": "freeply.example.com", "custom_domain": true },
+  //   { "pattern": "workspace.example.com", "custom_domain": true },
+  // ],
+
   "triggers": {
     "crons": [
       // Token refresh. Daily is enough: refreshes start 7 days before expiry, so

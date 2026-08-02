@@ -9,6 +9,7 @@ export const FIXTURE_SECRETS = {
   META_APP_SECRET: "test-meta-app-secret",
   INSTAGRAM_APP_SECRET: "test-instagram-app-secret",
   META_VERIFY_TOKEN: "test-verify-token",
+  MCP_STATS_TOKEN: "test-mcp-stats-token",
 } as const;
 
 /** Shaped like a real Instagram Business ID, which is what webhooks carry. */

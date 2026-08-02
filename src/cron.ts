@@ -9,7 +9,14 @@
  */
 
 import * as db from "./db";
-import { type CommentEvent, type Env, handleComment, matchesKeyword } from "./index";
+import {
+  type CommentEvent,
+  type Env,
+  handleComment,
+  matchesKeyword,
+  refreshRecentMediaStats,
+  refreshStaleAccountMedia,
+} from "./index";
 import { listRecentComments, listRecentMedia, refreshLongLivedToken } from "./instagram";
 
 const DAY_MS = 86_400_000;
@@ -51,9 +58,23 @@ const MAX_ACCOUNTS_PER_RUN = 5;
 /** Stop re-attempting a comment that has failed this many times. */
 const MAX_RECOVERY_FAILURES = 3;
 
+/**
+ * Post stats go stale on this clock instead of the dashboard's 15-minute TTL —
+ * nobody should have to open the dashboard just to keep the numbers fresh. At
+ * one sweep an hour the worst case is 12 posts × 3 Graph calls, comfortably
+ * inside the hourly budget reconcile's caps already account for.
+ */
+const STATS_MAX_AGE_MS = 60 * 60 * 1000;
+
 export async function scheduled(controller: ScheduledController, env: Env): Promise<void> {
   if (controller.cron === TOKEN_REFRESH_CRON) await refreshTokens(env);
-  else await reconcile(env);
+  else {
+    await reconcile(env);
+    // Discovery before stats: a post published since the last cycle gets its
+    // row first, so the very same sweep can fill its numbers in.
+    await refreshStaleAccountMedia(env, STATS_MAX_AGE_MS);
+    await refreshRecentMediaStats(env, STATS_MAX_AGE_MS);
+  }
 }
 
 /* --------------------------------------------------------------- refresh */

@@ -10,6 +10,10 @@ import { scheduled } from "./cron";
 import { MANUAL_MEDIA, type Tab, dashboardPage, loginPage } from "./dashboard";
 import * as db from "./db";
 import { canEscape, escapePage, isInAppBrowser } from "./escape";
+import { filesIndex, serveFile } from "./files";
+import { ICON_SVG, appleIconBytes } from "./icon";
+import { WORKSPACE_HTML } from "./workspace-html";
+import { handleMcp } from "./mcp";
 import {
   ICE_BREAKER_PREFIX,
   MAX_ICE_BREAKERS,
@@ -37,6 +41,21 @@ export interface Env {
   META_VERIFY_TOKEN: string;
 
   OPERATOR_EMAIL: string;
+
+  /**
+   * Gates the read-only /mcp stats endpoint (see src/mcp.ts). Deliberately not
+   * the dashboard password: this token leaves the machine (it lives in a
+   * claude.ai connector config) and must never open the dashboard. Unset = off.
+   */
+  MCP_STATS_TOKEN?: string;
+
+  /**
+   * Reels and renders for the cash.builds workspace (see src/files.ts). Optional
+   * because the Worker is useful without it — Freeply itself never reads it, and
+   * an operator who hasn't created the bucket should get a clear 503 from /files
+   * rather than a broken deploy.
+   */
+  MEDIA?: R2Bucket;
 }
 
 export { AccountDO } from "./account-do";
@@ -45,6 +64,20 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Token-authed, never by session — the caller is a claude.ai connector,
+    // not a browser. Auth and 404-when-off live inside the handler.
+    if (path === "/mcp" || path.startsWith("/mcp/")) return handleMcp(request, path, env);
+
+    // OAuth discovery probes, answered with a clean 404 so a client concludes
+    // there is no authorization server to negotiate with and just calls /mcp
+    // with its capability URL. Without this they fall through to the catch-all
+    // session redirect below, mistake the login page for a sign-in service, and
+    // fail dynamic client registration — which is exactly what claude.ai's
+    // "couldn't register with Freeply's sign-in service" error was.
+    if (path.startsWith("/.well-known/") || path === "/register") {
+      return new Response("not found", { status: 404 });
+    }
 
     // Authenticated by signature, never by session — Meta has no cookie.
     if (path === "/webhook") {
@@ -60,6 +93,19 @@ export default {
     const operator = configured || "the operator of this instance";
     if (path === "/privacy") return privacyPage(operator, url.host);
     if (path === "/data-deletion") return dataDeletionPage(operator, url.host);
+
+    // Icons stay public — the login page and iOS home-screen fetches have no
+    // session to show.
+    if (path === "/icon.svg") {
+      return new Response(ICON_SVG, {
+        headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" },
+      });
+    }
+    if (path === "/apple-touch-icon.png") {
+      return new Response(appleIconBytes(), {
+        headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" },
+      });
+    }
 
     if (path.startsWith("/l/")) {
       const code = path.slice(3);
@@ -95,17 +141,28 @@ export default {
     }
 
     if (path === "/login") {
-      if (request.method === "GET") return loginPage();
+      // Only same-site absolute paths come back out of this — "//evil.com" is a
+      // protocol-relative URL, so rejecting a second leading slash is what stops
+      // this being an open redirect.
+      const safeNext = (v: unknown) => {
+        const s = String(v ?? "");
+        return s.startsWith("/") && !s.startsWith("//") ? s : "/";
+      };
+
+      if (request.method === "GET") {
+        return loginPage(undefined, safeNext(url.searchParams.get("next")));
+      }
       const form = await request.formData();
       const supplied = String(form.get("password") ?? "");
+      const next = safeNext(form.get("next"));
 
       if (!env.DASHBOARD_PASSWORD || !constantTimeEqual(supplied, env.DASHBOARD_PASSWORD)) {
-        return loginPage("Incorrect password.");
+        return loginPage("Incorrect password.", next);
       }
       return new Response(null, {
         status: 302,
         headers: {
-          location: "/",
+          location: next,
           "set-cookie": sessionCookie(await createSession(env.DASHBOARD_PASSWORD)),
         },
       });
@@ -120,7 +177,15 @@ export default {
 
     /* ---- everything past here needs a session ---- */
     if (!(await isValidSession(request.headers.get("cookie"), env.DASHBOARD_PASSWORD))) {
-      return new Response(null, { status: 302, headers: { location: "/login" } });
+      // Carry the destination through the sign-in, so opening the workspace cold
+      // lands on the workspace instead of Freeply's own dashboard.
+      // GET only: a POST can't be replayed after sign-in, so carrying its path
+      // would just bounce the visitor to a 405 once they're through.
+      const next =
+        request.method === "GET" && path !== "/"
+          ? `?next=${encodeURIComponent(path + url.search)}`
+          : "";
+      return new Response(null, { status: 302, headers: { location: `/login${next}` } });
     }
 
     if (path === "/auth/start") {
@@ -130,6 +195,26 @@ export default {
       );
     }
     if (path === "/auth/callback") return handleAuthCallback(url, env);
+
+    // The cash.builds workspace, served from the same origin as its data so its
+    // Refresh button can actually call /refresh. Session-gated by the check above.
+    if (path === "/workspace") {
+      return new Response(WORKSPACE_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+    // Media for the workspace, same origin and the same session as /workspace —
+    // so a reel opened on the phone is one tap from the dashboard and needs no
+    // second password. Read-only: there is no upload route (see src/files.ts).
+    if (path === "/files") return filesIndex(env);
+    if (path.startsWith("/files/")) {
+      return serveFile(request, env, decodeURIComponent(path.slice("/files/".length)));
+    }
+    if (path === "/stats.json") {
+      return new Response(JSON.stringify(await db.postStatsReport(env.DB, 24)), {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+    }
     if (path === "/") {
       const requested = url.searchParams.get("tab");
       const tab: Tab =
@@ -140,6 +225,16 @@ export default {
         status: url.searchParams.get("status") ?? undefined,
         error: url.searchParams.get("error") ?? undefined,
       });
+    }
+
+    // Manual sweep, cache ignored — the cron's hourly clock is a floor, not a
+    // gate. Session-guarded like every dashboard action; scripts get in by
+    // logging in first (see RUNBOOK in the cash-builds workspace).
+    if (path === "/refresh") {
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      await refreshStaleAccountMedia(env, 0);
+      await refreshRecentMediaStats(env, 0);
+      return new Response(null, { status: 302, headers: { location: "/" } });
     }
 
     if (request.method === "POST") {
@@ -368,6 +463,7 @@ async function renderDashboard(
   // Only the overview renders post metrics, and only the campaign form offers
   // the post picker, so each tab pays for its own refresh and no other.
   const fresh = tab === "overview" ? await refreshPostStats(env, posts) : posts;
+  if (tab === "overview") await refreshRecentMediaStats(env);
   const media = tab === "campaigns" ? await pickableMedia(env, accounts) : [];
   const editing = editId ? (campaigns.find((c) => c.id === editId) ?? null) : null;
   return dashboardPage({
@@ -436,6 +532,61 @@ async function refreshPostStats(
 
   const byId = new Map(updated.filter(Boolean).map((p) => [p!.mediaId, p!]));
   return posts.map((p) => byId.get(p.mediaId) ?? p);
+}
+
+/**
+ * refreshPostStats starts from sends, so a recent post with no campaign never
+ * gets stats cached at all. This tops up the newest posts from the account
+ * media cache — same TTL, same tolerance — so post_stats describes the
+ * account, not just the funnels. Capped: each stale post costs up to three
+ * Graph API calls, and the overview blocks on this.
+ */
+const MEDIA_STATS_LIMIT = 12;
+
+/**
+ * The discovery half of the hourly sweep. Stats refresh only covers posts
+ * already in account_media, and until now that cache was only written when the
+ * campaigns tab loaded — so a post published after the last dashboard visit
+ * stayed invisible to the cron indefinitely. One list call per account per
+ * cycle keeps discovery on the same clock as the stats it feeds.
+ */
+export async function refreshStaleAccountMedia(env: Env, maxAgeMs: number): Promise<void> {
+  const cutoff = Date.now() - maxAgeMs;
+  const accounts = await db.listAccounts(env.DB);
+
+  for (const account of accounts) {
+    if (account.needsReconnect) continue;
+    const checked = await db.mediaCheckedAt(env.DB, account.igUserId);
+    if (checked !== null && checked >= cutoff) continue;
+
+    const token = await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, account.igUserId);
+    if (!token) continue;
+
+    const media = await getRecentMedia(token, MEDIA_PICKER_LIMIT);
+    if (media) await db.saveAccountMedia(env.DB, account.igUserId, media);
+  }
+}
+
+export async function refreshRecentMediaStats(env: Env, maxAgeMs?: number): Promise<void> {
+  const stale = await db.staleRecentMediaStats(env.DB, MEDIA_STATS_LIMIT, maxAgeMs);
+  if (stale.length === 0) return;
+
+  const tokens = new Map<string, string | null>();
+  await Promise.all(
+    stale.map(async (m) => {
+      if (!tokens.has(m.igUserId)) {
+        tokens.set(
+          m.igUserId,
+          await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, m.igUserId),
+        );
+      }
+      const token = tokens.get(m.igUserId);
+      if (!token) return;
+
+      const s = await getMediaStats(m.mediaId, token);
+      if (s) await db.savePostStats(env.DB, m.mediaId, s);
+    }),
+  );
 }
 
 /* -------------------------------------------------------------------- oauth */

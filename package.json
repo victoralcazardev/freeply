@@ -11,7 +11,8 @@
   },
   "scripts": {
     "dev": "wrangler d1 migrations apply freeply --local && wrangler dev",
-    "deploy": "wrangler deploy",
+    "build:workspace": "node scripts/build-workspace.mjs",
+    "deploy": "npm run build:workspace && wrangler deploy",
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

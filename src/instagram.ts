@@ -317,6 +317,11 @@ export interface MediaStats {
   comments: number | null;
   saved: number | null;
   shares: number | null;
+  views: number | null;
+  /** Percentage of views skipped in the first 3 seconds. Reels only. */
+  skipRate: number | null;
+  /** Average watch time in milliseconds. Reels only. */
+  avgWatchMs: number | null;
   permalink: string | null;
   caption: string | null;
   thumbnailUrl: string | null;
@@ -335,18 +340,32 @@ export async function getMediaStats(
   accessToken: string,
 ): Promise<MediaStats | null> {
   const insightsUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}/insights`);
-  insightsUrl.searchParams.set("metric", "reach,likes,comments,saved,shares");
+  // views replaced plays/impressions across all media types in 2025, so it can
+  // ride in the base list. The reel-only pair can't — one invalid metric fails
+  // the whole call — so those go in a second request gated on product type.
+  insightsUrl.searchParams.set("metric", "reach,likes,comments,saved,shares,views");
   insightsUrl.searchParams.set("access_token", accessToken);
 
   const metaUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}`);
   // thumbnail_url only exists on video; images put their preview in media_url.
+  // media_product_type distinguishes a REELS video from a feed video.
   metaUrl.searchParams.set(
     "fields",
-    "permalink,caption,media_type,media_url,thumbnail_url",
+    "permalink,caption,media_type,media_product_type,media_url,thumbnail_url",
   );
   metaUrl.searchParams.set("access_token", accessToken);
 
-  const [insightsRes, metaRes] = await Promise.all([fetch(insightsUrl), fetch(metaUrl)]);
+  let insightsRes: Response;
+  let metaRes: Response;
+  try {
+    [insightsRes, metaRes] = await Promise.all([fetch(insightsUrl), fetch(metaUrl)]);
+  } catch (cause) {
+    // A network-level throw here used to escape uncaught and 500 whatever was
+    // blocking on the sweep — the overview render included. Same soft-fail
+    // contract as getJson: this post stays blank, everything else proceeds.
+    console.error(`media stats fetch failed for ${mediaId}:`, cause);
+    return null;
+  }
 
   if (!insightsRes.ok) {
     console.error(`insights failed for ${mediaId}:`, (await insightsRes.text()).slice(0, 200));
@@ -357,6 +376,7 @@ export async function getMediaStats(
   let caption: string | null = null;
   let thumbnailUrl: string | null = null;
   let mediaType: string | null = null;
+  let mediaProductType: string | null = null;
 
   if (metaRes.ok) {
     try {
@@ -364,15 +384,46 @@ export async function getMediaStats(
         permalink?: string;
         caption?: string;
         media_type?: string;
+        media_product_type?: string;
         media_url?: string;
         thumbnail_url?: string;
       };
       permalink = m.permalink ?? null;
       caption = m.caption ?? null;
       mediaType = m.media_type ?? null;
+      mediaProductType = m.media_product_type ?? null;
       thumbnailUrl = m.thumbnail_url ?? m.media_url ?? null;
     } catch {
       // Presentation only — its absence shouldn't lose the metrics.
+    }
+  }
+
+  // Meta flags both reel metrics "in development"; they come and go. A failure
+  // here nulls the pair rather than losing the base metrics above.
+  let skipRate: number | null = null;
+  let avgWatchMs: number | null = null;
+  if (mediaProductType === "REELS") {
+    const reelUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}/insights`);
+    reelUrl.searchParams.set("metric", "reels_skip_rate,ig_reels_avg_watch_time");
+    reelUrl.searchParams.set("access_token", accessToken);
+    try {
+      const reelRes = await fetch(reelUrl);
+      if (reelRes.ok) {
+        const body = (await reelRes.json()) as {
+          data?: Array<{ name: string; values?: Array<{ value: number }> }>;
+        };
+        const pick = (name: string) =>
+          body.data?.find((m) => m.name === name)?.values?.[0]?.value ?? null;
+        skipRate = pick("reels_skip_rate");
+        avgWatchMs = pick("ig_reels_avg_watch_time");
+      } else {
+        console.error(
+          `reel insights failed for ${mediaId}:`,
+          (await reelRes.text()).slice(0, 200),
+        );
+      }
+    } catch {
+      // Tolerated for the same reason as above.
     }
   }
 
@@ -389,6 +440,9 @@ export async function getMediaStats(
       comments: pick("comments"),
       saved: pick("saved"),
       shares: pick("shares"),
+      views: pick("views"),
+      skipRate,
+      avgWatchMs,
       permalink,
       caption,
       thumbnailUrl,

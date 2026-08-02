@@ -120,6 +120,8 @@ a:has(.post):hover span { color: var(--accent); }
 function page(title: string, body: string): Response {
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+      `<link rel="icon" type="image/svg+xml" href="/icon.svg">` +
+      `<link rel="apple-touch-icon" href="/apple-touch-icon.png">` +
       `<meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<title>${esc(title)} — Freeply</title><style>${STYLE}</style></head>` +
       `<body><div class="wrap">${body}</div></body></html>`,
@@ -127,12 +129,17 @@ function page(title: string, body: string): Response {
   );
 }
 
-export function loginPage(error?: string): Response {
+export function loginPage(error?: string, next?: string): Response {
+  // `next` carries where the visitor was actually going. Without it every sign-in
+  // lands on the Freeply dashboard — so opening the cash.builds workspace cold
+  // dumped you somewhere you didn't ask for.
+  const heading = next === "/workspace" ? "cash.builds" : "Freeply";
   return page(
     "Sign in",
-    `<header><h1>Freeply</h1></header>
+    `<header><h1>${esc(heading)}</h1></header>
      ${error ? `<p class="card" style="color:var(--bad)">${esc(error)}</p>` : ""}
      <form method="post" action="/login" class="card" style="max-width:22rem">
+       ${next ? `<input type="hidden" name="next" value="${esc(next)}">` : ""}
        <label for="p">Dashboard password</label>
        <input id="p" type="password" name="password" autofocus autocomplete="current-password">
        <p><button class="primary" type="submit">Sign in</button></p>
@@ -322,7 +329,11 @@ function overviewTab(
         .join("")}
     </div>
 
-    <h2>Post performance</h2>
+    <h2>Post performance
+      <form method="post" action="/refresh" style="display:inline;margin-left:8px">
+        <button class="small" title="Re-read posts and stats from Instagram right now, ignoring the cache">Refresh now</button>
+      </form>
+    </h2>
     ${
       posts.length === 0
         ? `<div class="card muted">No posts have produced DMs yet.</div>`

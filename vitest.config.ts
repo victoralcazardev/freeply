@@ -27,6 +27,7 @@ export default defineConfig({
           INSTAGRAM_APP_SECRET: "test-instagram-app-secret",
           META_VERIFY_TOKEN: "test-verify-token",
           OPERATOR_EMAIL: "operator@example.test",
+          MCP_STATS_TOKEN: "test-mcp-stats-token",
         },
       },
     })),

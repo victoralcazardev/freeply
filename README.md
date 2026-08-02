@@ -483,6 +483,19 @@ as proven. In particular:
   transient split are written against Meta's documented error codes.
 - **The post picker calls `GET /me/media`, which hasn't been exercised live either.** If it
   returns nothing the form falls back to the raw post ID field, so this one fails softly.
+  Since 1 Aug 2026 the reconcile cron runs the same call hourly (`refreshStaleAccountMedia`)
+  so new posts are discovered without anyone opening the dashboard — previously the
+  campaigns tab was the only writer of `account_media`, and the stats sweep could only
+  refresh posts it already knew about. Written and tested; the cron path hasn't been
+  observed against live Meta yet.
+- **The reel metrics (`views`, `reels_skip_rate`, `ig_reels_avg_watch_time`) haven't been
+  observed live.** The base insights call is proven; the reel-only pair rides in a second,
+  gated request because Meta flags both "in development", and a failure there nulls the
+  pair rather than losing the base metrics. Same soft-fail story for the stats top-up of
+  recent posts without campaigns (`staleRecentMediaStats`): capped at 12 posts, runs on
+  overview loads (15-minute TTL) and on the reconcile cron (hourly TTL), and a post whose
+  metrics can't be read just stays blank. The dashboard-load path has run against live
+  Meta; the cron path hasn't fired yet as of this writing.
 - **Story replies and Ice Breakers have never run against live Meta at all.** They're the
   newest thing here, they need the `messages` and `messaging_postbacks` webhook fields
   subscribed, and whether Meta delivers a story reply with the story id attached — which

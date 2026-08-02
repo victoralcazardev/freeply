@@ -20,6 +20,8 @@ const STYLE = `
 function page(title: string, body: string): Response {
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+      `<link rel="icon" type="image/svg+xml" href="/icon.svg">` +
+      `<link rel="apple-touch-icon" href="/apple-touch-icon.png">` +
       `<meta name="viewport" content="width=device-width,initial-scale=1">` +
       `<title>${title}</title><style>${STYLE}</style></head><body>${body}</body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },

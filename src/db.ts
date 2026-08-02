@@ -690,6 +690,9 @@ export async function savePostStats(
     comments: number | null;
     saved: number | null;
     shares: number | null;
+    views: number | null;
+    skipRate: number | null;
+    avgWatchMs: number | null;
     permalink: string | null;
     caption: string | null;
     thumbnailUrl: string | null;
@@ -699,21 +702,72 @@ export async function savePostStats(
   await db
     .prepare(
       `INSERT INTO post_stats
-         (media_id, reach, likes, comments, saved, shares, permalink,
-          caption, thumbnail_url, media_type, fetched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (media_id, reach, likes, comments, saved, shares, views, skip_rate,
+          avg_watch_ms, permalink, caption, thumbnail_url, media_type, fetched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (media_id) DO UPDATE SET
          reach = excluded.reach, likes = excluded.likes, comments = excluded.comments,
          saved = excluded.saved, shares = excluded.shares,
+         views = excluded.views, skip_rate = excluded.skip_rate,
+         avg_watch_ms = excluded.avg_watch_ms,
          permalink = excluded.permalink, caption = excluded.caption,
          thumbnail_url = excluded.thumbnail_url, media_type = excluded.media_type,
          fetched_at = excluded.fetched_at`,
     )
     .bind(
-      mediaId, s.reach, s.likes, s.comments, s.saved, s.shares, s.permalink,
+      mediaId, s.reach, s.likes, s.comments, s.saved, s.shares, s.views,
+      s.skipRate, s.avgWatchMs, s.permalink,
       s.caption, s.thumbnailUrl, s.mediaType, Date.now(),
     )
     .run();
+}
+
+/**
+ * Recent posts whose cached stats are missing or aged out, newest first.
+ *
+ * post_stats otherwise only fills for posts that produced sends (the overview's
+ * join starts from `sends`), so a post with no campaign never gets stats at
+ * all — which makes the cache describe the funnels, not the account.
+ */
+export async function staleRecentMediaStats(
+  db: D1Database,
+  limit: number,
+  maxAgeMs = CACHE_TTL_MS,
+): Promise<Array<{ mediaId: string; igUserId: string }>> {
+  const cutoff = Date.now() - maxAgeMs;
+  const { results } = await db
+    .prepare(
+      `SELECT m.media_id AS mediaId, m.ig_user_id AS igUserId
+       FROM account_media m
+       LEFT JOIN post_stats p ON p.media_id = m.media_id
+       WHERE p.fetched_at IS NULL OR p.fetched_at < ?
+       ORDER BY m.posted_at DESC
+       LIMIT ?`,
+    )
+    .bind(cutoff, limit)
+    .all<{ mediaId: string; igUserId: string }>();
+  return results;
+}
+
+/**
+ * The full stats table the MCP endpoint serves — every post in the cache with
+ * whatever numbers the sweep has for it. Reads only what the runbook's manual
+ * query read; the endpoint holding this must never grow a write.
+ */
+export async function postStatsReport(db: D1Database, limit: number) {
+  const { results } = await db
+    .prepare(
+      `SELECT m.permalink, m.caption, m.posted_at AS postedAt,
+              p.views, p.reach, p.skip_rate AS skipRate, p.avg_watch_ms AS avgWatchMs,
+              p.likes, p.comments, p.saved, p.shares
+       FROM account_media m
+       LEFT JOIN post_stats p ON p.media_id = m.media_id
+       ORDER BY m.posted_at DESC
+       LIMIT ?`,
+    )
+    .bind(limit)
+    .all();
+  return results;
 }
 
 /* ----------------------------------------------------------- account media */
