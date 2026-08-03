@@ -117,23 +117,25 @@ a:has(.post) { text-decoration: none; color: inherit; }
 a:has(.post):hover span { color: var(--accent); }
 `;
 
-function page(title: string, body: string): Response {
+function page(title: string, body: string, brand = "Freeply"): Response {
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
       `<link rel="icon" type="image/svg+xml" href="/icon.svg">` +
       `<link rel="apple-touch-icon" href="/apple-touch-icon.png">` +
       `<meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>${esc(title)} — Freeply</title><style>${STYLE}</style></head>` +
+      `<title>${esc(title)} — ${esc(brand)}</title><style>${STYLE}</style></head>` +
       `<body><div class="wrap">${body}</div></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } },
   );
 }
 
-export function loginPage(error?: string, next?: string): Response {
+export function loginPage(error?: string, next?: string, brand?: string): Response {
   // `next` carries where the visitor was actually going. Without it every sign-in
   // lands on the Freeply dashboard — so opening the cash.builds workspace cold
   // dumped you somewhere you didn't ask for.
-  const heading = next === "/workspace" ? "cash.builds" : "Freeply";
+  // `brand` is the hostname's own answer and outranks `next`: on the workspace
+  // domain every sign-in is a cash.builds sign-in, whatever path asked for it.
+  const heading = brand ?? (next === "/workspace" ? "cash.builds" : "Freeply");
   return page(
     "Sign in",
     `<header><h1>${esc(heading)}</h1></header>
@@ -144,6 +146,7 @@ export function loginPage(error?: string, next?: string): Response {
        <input id="p" type="password" name="password" autofocus autocomplete="current-password">
        <p><button class="primary" type="submit">Sign in</button></p>
      </form>`,
+    heading,
   );
 }
 

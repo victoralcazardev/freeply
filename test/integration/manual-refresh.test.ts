@@ -132,3 +132,59 @@ describe("sign-in destination", () => {
     }
   });
 });
+
+/**
+ * One brand per hostname: cashbuilds.cannappy.org IS the cash.builds workspace,
+ * freeply.cannappy.org IS Freeply. Carrying the destination through sign-in (the
+ * block above) fixed landing on Freeply *after* asking for the workspace; this
+ * fixes the domain itself answering as Freeply before anything was asked.
+ */
+describe("hostname split", () => {
+  const signedInGet = async (target: string) => {
+    const cookie = sessionCookie(await createSession(FIXTURE_SECRETS.DASHBOARD_PASSWORD));
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request(target, { headers: { cookie: cookie.split(";")[0] } }),
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    return res;
+  };
+
+  it("serves the workspace at the root of the workspace host", async () => {
+    const res = await signedInGet("https://cashbuilds.cannappy.org/");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("cash.builds");
+  });
+
+  it("hands a Freeply path on the workspace host over to Freeply's own", async () => {
+    const res = await signedInGet("https://cashbuilds.cannappy.org/campaigns?tab=links");
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://freeply.cannappy.org/campaigns?tab=links");
+  });
+
+  it("hands /workspace on the Freeply host over to the workspace host", async () => {
+    const res = await signedInGet("https://freeply.cannappy.org/workspace");
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://cashbuilds.cannappy.org/workspace");
+  });
+
+  // Both pages call these, and the session cookie is host-scoped — bouncing them
+  // across hostnames would drop the session mid-request and land on a login.
+  it("keeps the shared endpoints answering on both hostnames", async () => {
+    for (const host of ["cashbuilds.cannappy.org", "freeply.cannappy.org"]) {
+      const res = await signedInGet(`https://${host}/stats.json`);
+      expect({ host, status: res.status }).toEqual({ host, status: 200 });
+    }
+  });
+
+  // The escape hatch: if a custom domain ever misbehaves, the workers.dev name
+  // still reaches both halves the way it always did.
+  it("leaves the workers.dev hostname unsplit", async () => {
+    const dashboard = await signedInGet("https://freeply.cannappy.workers.dev/");
+    expect(dashboard.status).toBe(200);
+    const workspace = await signedInGet("https://freeply.cannappy.workers.dev/workspace");
+    expect(workspace.status).toBe(200);
+  });
+});

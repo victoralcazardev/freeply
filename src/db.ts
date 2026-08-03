@@ -693,6 +693,13 @@ export async function savePostStats(
     views: number | null;
     skipRate: number | null;
     avgWatchMs: number | null;
+    // Optional: D1 rejects `undefined` outright, and a caller built before these
+    // columns existed simply omits them. Coerced to null at bind time below.
+    totalWatchMs?: number | null;
+    interactions?: number | null;
+    reposts?: number | null;
+    follows?: number | null;
+    profileVisits?: number | null;
     permalink: string | null;
     caption: string | null;
     thumbnailUrl: string | null;
@@ -703,21 +710,28 @@ export async function savePostStats(
     .prepare(
       `INSERT INTO post_stats
          (media_id, reach, likes, comments, saved, shares, views, skip_rate,
-          avg_watch_ms, permalink, caption, thumbnail_url, media_type, fetched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          avg_watch_ms, total_watch_ms, interactions, reposts,
+          follows, profile_visits,
+          permalink, caption, thumbnail_url, media_type, fetched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (media_id) DO UPDATE SET
          reach = excluded.reach, likes = excluded.likes, comments = excluded.comments,
          saved = excluded.saved, shares = excluded.shares,
          views = excluded.views, skip_rate = excluded.skip_rate,
          avg_watch_ms = excluded.avg_watch_ms,
+         total_watch_ms = excluded.total_watch_ms,
+         interactions = excluded.interactions, reposts = excluded.reposts,
+         follows = excluded.follows, profile_visits = excluded.profile_visits,
          permalink = excluded.permalink, caption = excluded.caption,
          thumbnail_url = excluded.thumbnail_url, media_type = excluded.media_type,
          fetched_at = excluded.fetched_at`,
     )
     .bind(
       mediaId, s.reach, s.likes, s.comments, s.saved, s.shares, s.views,
-      s.skipRate, s.avgWatchMs, s.permalink,
-      s.caption, s.thumbnailUrl, s.mediaType, Date.now(),
+      s.skipRate, s.avgWatchMs,
+      s.totalWatchMs ?? null, s.interactions ?? null, s.reposts ?? null,
+      s.follows ?? null, s.profileVisits ?? null,
+      s.permalink, s.caption, s.thumbnailUrl, s.mediaType, Date.now(),
     )
     .run();
 }
@@ -768,6 +782,45 @@ export async function postStatsReport(db: D1Database, limit: number) {
     .bind(limit)
     .all();
   return results;
+}
+
+/* -------------------------------------------------------- workspace state */
+
+/** Sections the workspace page keeps. Anything else is rejected at the route, so
+ *  a stray client can't grow this table a row at a time. */
+export const WORKSPACE_SECTIONS = ["queue", "actions", "backlog", "miles", "ideas"];
+
+/** Every stored section, shaped for the page's reconcile loop:
+ *  `{ queue: { value, updatedAt }, … }`. Missing sections are simply absent —
+ *  the page reads that as "server has never seen this" and seeds it. */
+export async function workspaceState(db: D1Database) {
+  const { results } = await db
+    .prepare(`SELECT section, value, updated_at AS updatedAt FROM workspace_state`)
+    .all<{ section: string; value: string; updatedAt: number }>();
+  const out: Record<string, { value: unknown; updatedAt: number }> = {};
+  for (const row of results) {
+    try {
+      out[row.section] = { value: JSON.parse(row.value), updatedAt: row.updatedAt };
+    } catch {
+      // A row that won't parse is worse than a missing one: the page would adopt
+      // it and wipe a good local copy. Skip it and let this device re-seed.
+    }
+  }
+  return out;
+}
+
+/** Upsert one section. Returns the stamp the page records as "what I last saw",
+ *  which is what makes the next pull a no-op instead of a round trip. */
+export async function saveWorkspaceState(db: D1Database, section: string, value: string) {
+  const updatedAt = Date.now();
+  await db
+    .prepare(
+      `INSERT INTO workspace_state (section, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(section) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    )
+    .bind(section, value, updatedAt)
+    .run();
+  return updatedAt;
 }
 
 /* ----------------------------------------------------------- account media */

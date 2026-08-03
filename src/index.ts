@@ -60,10 +60,34 @@ export interface Env {
 
 export { AccountDO } from "./account-do";
 
+/**
+ * The two custom domains this Worker answers on (see wrangler.jsonc `routes`).
+ * They are one brand each: the workspace host serves cash.builds, the Freeply
+ * host serves Freeply, and each hands a visitor who asks for the other brand's
+ * page over to the hostname that owns it.
+ */
+const WORKSPACE_HOST = "cashbuilds.cannappy.org";
+const FREEPLY_HOST = "freeply.cannappy.org";
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // One worker, two brands, split by hostname: cashbuilds.cannappy.org IS the
+    // cash.builds workspace, freeply.cannappy.org IS Freeply's dashboard. They
+    // can't be two workers — the workspace page calls /stats.json and /refresh
+    // same-origin and reads its media off the same session cookie.
+    // The workers.dev name is deliberately left unsplit, so it still reaches
+    // either half if a custom domain ever misbehaves.
+    const onWorkspaceHost = url.hostname === WORKSPACE_HOST;
+    const onFreeplyHost = url.hostname === FREEPLY_HOST;
+    // Endpoints both brands call. /refresh in particular is posted by Freeply's
+    // own Overview tab AND by the workspace's Refresh button, so it has to keep
+    // answering on both names — the session cookie is host-scoped, and bouncing
+    // that POST across hostnames would drop the session and land on a login.
+    const sharedApi = path === "/refresh" || path === "/stats.json" || path === "/files" ||
+      path === "/workspace-state" || path.startsWith("/files/");
 
     // Token-authed, never by session — the caller is a claude.ai connector,
     // not a browser. Auth and 404-when-off live inside the handler.
@@ -149,15 +173,19 @@ export default {
         return s.startsWith("/") && !s.startsWith("//") ? s : "/";
       };
 
+      // The hostname decides the name on the sign-in page: the workspace domain
+      // never says "Freeply" at any point, including on the way in.
+      const brand = onWorkspaceHost ? "cash.builds" : undefined;
+
       if (request.method === "GET") {
-        return loginPage(undefined, safeNext(url.searchParams.get("next")));
+        return loginPage(undefined, safeNext(url.searchParams.get("next")), brand);
       }
       const form = await request.formData();
       const supplied = String(form.get("password") ?? "");
       const next = safeNext(form.get("next"));
 
       if (!env.DASHBOARD_PASSWORD || !constantTimeEqual(supplied, env.DASHBOARD_PASSWORD)) {
-        return loginPage("Incorrect password.", next);
+        return loginPage("Incorrect password.", next, brand);
       }
       return new Response(null, {
         status: 302,
@@ -188,6 +216,29 @@ export default {
       return new Response(null, { status: 302, headers: { location: `/login${next}` } });
     }
 
+    /* ---- one brand per hostname, from here down ---- */
+    // Only pages split. Everything above the session gate — webhooks, /l/ tracked
+    // links, /mcp, icons, /login — is plumbing that has to answer on every
+    // hostname, because links already sitting in real DMs point at both names.
+    // 302 for GET so no browser caches the split into permanence; 307 for the
+    // rest so a stray form post keeps its method instead of arriving as a GET.
+    const handOverTo = (host: string) =>
+      new Response(null, {
+        status: request.method === "GET" ? 302 : 307,
+        headers: { location: `https://${host}${path}${url.search}` },
+      });
+    if (onWorkspaceHost && path !== "/" && !sharedApi && path !== "/workspace") {
+      return handOverTo(FREEPLY_HOST);
+    }
+    if (onFreeplyHost && path === "/workspace") return handOverTo(WORKSPACE_HOST);
+    // The workspace is what this hostname is for, so it answers at the root —
+    // no /workspace to remember and no Freeply dashboard flashing past first.
+    if (onWorkspaceHost && path === "/") {
+      return new Response(WORKSPACE_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
     if (path === "/auth/start") {
       return Response.redirect(
         authorizeUrl(env.INSTAGRAM_APP_ID, `${url.origin}/auth/callback`),
@@ -214,6 +265,41 @@ export default {
       return new Response(JSON.stringify(await db.postStatsReport(env.DB, 24)), {
         headers: { "content-type": "application/json", "cache-control": "no-store" },
       });
+    }
+    // Card state for the workspace board. It lived in localStorage until 8/3, which
+    // meant every device kept a private copy and they diverged the moment two got
+    // used. Session-gated by the check above, same as /stats.json — the board is
+    // behind the dashboard password, not public.
+    if (path === "/workspace-state") {
+      if (request.method === "GET") {
+        return new Response(JSON.stringify(await db.workspaceState(env.DB)), {
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
+        });
+      }
+      if (request.method === "POST") {
+        let body: { section?: unknown; value?: unknown };
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          return new Response("bad json", { status: 400 });
+        }
+        const section = String(body.section ?? "");
+        if (!db.WORKSPACE_SECTIONS.includes(section)) {
+          return new Response("unknown section", { status: 400 });
+        }
+        if (body.value === undefined || body.value === null) {
+          return new Response("missing value", { status: 400 });
+        }
+        const value = JSON.stringify(body.value);
+        // A board section is a few KB. Anything near this ceiling is a bug or a
+        // loop, and D1 rows are not the place to find out.
+        if (value.length > 256 * 1024) return new Response("too large", { status: 413 });
+        const updatedAt = await db.saveWorkspaceState(env.DB, section, value);
+        return new Response(JSON.stringify({ updatedAt }), {
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
+        });
+      }
+      return new Response("method not allowed", { status: 405 });
     }
     if (path === "/") {
       const requested = url.searchParams.get("tab");

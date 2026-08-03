@@ -322,10 +322,41 @@ export interface MediaStats {
   skipRate: number | null;
   /** Average watch time in milliseconds. Reels only. */
   avgWatchMs: number | null;
+  /** Total watch time across all views, ms. Catches replays. Reels only. */
+  totalWatchMs: number | null;
+  /** likes+comments+saves+shares as Meta counts it. Rides the reels request. */
+  interactions: number | null;
+  /** reposts_count — a media field, owner-only, feed + reels. */
+  reposts: number | null;
+  /** Accounts that followed as a result of this post. */
+  follows: number | null;
+  /** Profile visits driven by this post. */
+  profileVisits: number | null;
   permalink: string | null;
   caption: string | null;
   thumbnailUrl: string | null;
   mediaType: string | null;
+}
+
+/** One metric row, in either shape Meta uses. */
+interface InsightRow {
+  name: string;
+  values?: Array<{ value: number }>;
+  total_value?: { value?: number };
+}
+
+/**
+ * Pulls a metric out of an insights payload.
+ *
+ * Meta returns two different shapes and doesn't document which metric uses which:
+ * the long-standing ones carry `values: [{value}]`, while several of the newer
+ * "in development" ones carry a single `total_value: {value}`. Reading only
+ * `values[0]` makes a metric that IS present look absent — the call succeeds,
+ * the number silently comes back null, and nothing errors. Accept both.
+ */
+function pickMetric(rows: InsightRow[] | undefined, name: string): number | null {
+  const row = rows?.find((m) => m.name === name);
+  return row?.values?.[0]?.value ?? row?.total_value?.value ?? null;
 }
 
 /**
@@ -402,20 +433,34 @@ export async function getMediaStats(
   // here nulls the pair rather than losing the base metrics above.
   let skipRate: number | null = null;
   let avgWatchMs: number | null = null;
+  let totalWatchMs: number | null = null;
+  let interactions: number | null = null;
   if (mediaProductType === "REELS") {
     const reelUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}/insights`);
-    reelUrl.searchParams.set("metric", "reels_skip_rate,ig_reels_avg_watch_time");
+    // total_interactions isn't reels-only, but it IS "in development", and one bad
+    // metric fails the whole request — so it rides here in the already-tolerated
+    // call rather than in the base list, where a wobble would cost reach/likes/views.
+    // The price is that feed posts never fill it. Fine: this account posts reels.
+    reelUrl.searchParams.set(
+      "metric",
+      "reels_skip_rate,ig_reels_avg_watch_time,ig_reels_video_view_total_time,total_interactions",
+    );
     reelUrl.searchParams.set("access_token", accessToken);
     try {
       const reelRes = await fetch(reelUrl);
       if (reelRes.ok) {
-        const body = (await reelRes.json()) as {
-          data?: Array<{ name: string; values?: Array<{ value: number }> }>;
-        };
-        const pick = (name: string) =>
-          body.data?.find((m) => m.name === name)?.values?.[0]?.value ?? null;
-        skipRate = pick("reels_skip_rate");
-        avgWatchMs = pick("ig_reels_avg_watch_time");
+        const body = (await reelRes.json()) as { data?: InsightRow[] };
+        skipRate = pickMetric(body.data, "reels_skip_rate");
+        avgWatchMs = pickMetric(body.data, "ig_reels_avg_watch_time");
+        totalWatchMs = pickMetric(body.data, "ig_reels_video_view_total_time");
+        interactions = pickMetric(body.data, "total_interactions");
+        // Names Meta accepted but returned nothing for. Without this you cannot tell
+        // "metric absent" from "parser missed it" — the symptom is identical.
+        const missing = ["ig_reels_video_view_total_time", "total_interactions"]
+          .filter((n) => !body.data?.some((m) => m.name === n));
+        if (missing.length) {
+          console.log(`insights omitted for ${mediaId}: ${missing.join(",")}`);
+        }
       } else {
         console.error(
           `reel insights failed for ${mediaId}:`,
@@ -427,12 +472,65 @@ export async function getMediaStats(
     }
   }
 
+  // follows / profile_visits: the growth pair. Whether REELS supports them is exactly
+  // the open question — a scraped doc table said feed-and-story only, Instagram's own
+  // Help Center describes Follows as a reel insight, and neither is this account.
+  //
+  // Deliberately its OWN request, not appended to the reel metrics above: if Meta
+  // rejects a metric the entire request fails, and that request is currently the only
+  // source of skip rate and watch time. An unproven metric must not be able to take
+  // working ones down with it. On rejection Meta names the offending metric in the
+  // error body — that response is the answer, so it gets logged verbatim.
+  let follows: number | null = null;
+  let profileVisits: number | null = null;
   try {
-    const body = (await insightsRes.json()) as {
-      data?: Array<{ name: string; values?: Array<{ value: number }> }>;
-    };
-    const pick = (name: string) =>
-      body.data?.find((m) => m.name === name)?.values?.[0]?.value ?? null;
+    const growthUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}/insights`);
+    growthUrl.searchParams.set("metric", "follows,profile_visits");
+    growthUrl.searchParams.set("access_token", accessToken);
+    const growthRes = await fetch(growthUrl);
+    if (growthRes.ok) {
+      const body = (await growthRes.json()) as { data?: InsightRow[] };
+      follows = pickMetric(body.data, "follows");
+      profileVisits = pickMetric(body.data, "profile_visits");
+    } else {
+      console.log(
+        `growth metrics rejected for ${mediaId} (${mediaProductType}):`,
+        (await growthRes.text()).slice(0, 300),
+      );
+    }
+  } catch {
+    // Same soft-fail contract as every other optional metric here.
+  }
+
+  // reposts_count is a media FIELD, not an insights metric, and it's newer than the
+  // rest (April 2026). It gets its own request rather than joining the `fields` list
+  // above: an unsupported field there would fail that call, and that call is what
+  // resolves media_product_type — which gates the reel metrics. A flaky new field
+  // must not be able to silently switch off skip rate and watch time.
+  let reposts: number | null = null;
+  try {
+    const repostUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}`);
+    repostUrl.searchParams.set("fields", "reposts_count");
+    repostUrl.searchParams.set("access_token", accessToken);
+    const repostRes = await fetch(repostUrl);
+    if (repostRes.ok) {
+      const r = (await repostRes.json()) as { reposts_count?: number };
+      reposts = r.reposts_count ?? null;
+    } else {
+      // Most likely cause is API_VERSION: reposts_count landed in the April 2026
+      // update and this client is pinned to v23.0. Logged, not thrown.
+      console.log(
+        `reposts_count unavailable (${API_VERSION}) for ${mediaId}:`,
+        (await repostRes.text()).slice(0, 160),
+      );
+    }
+  } catch {
+    // Same soft-fail contract: no reposts is not a reason to lose everything else.
+  }
+
+  try {
+    const body = (await insightsRes.json()) as { data?: InsightRow[] };
+    const pick = (name: string) => pickMetric(body.data, name);
 
     return {
       reach: pick("reach"),
@@ -443,6 +541,11 @@ export async function getMediaStats(
       views: pick("views"),
       skipRate,
       avgWatchMs,
+      totalWatchMs,
+      interactions,
+      reposts,
+      follows,
+      profileVisits,
       permalink,
       caption,
       thumbnailUrl,
