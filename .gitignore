@@ -30,6 +30,12 @@ ROADMAP.md
 COMPARISON.md
 TWO-STEP.md
 
+# Seed data for one operator's own account. Same reason as the notes above, more
+# sharply: post_notes rows are prose judgements keyed to live shortcodes — what a
+# post was, why it underperformed, which ones carry a claim that should come down.
+# That is a private read of a real account, and this repo is public.
+scripts/seed/
+
 # Editor / OS
 .DS_Store
 .idea/

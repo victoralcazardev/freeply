@@ -8,6 +8,8 @@ export interface Account {
   /** The refresh cron gave up; only re-authorizing by hand will fix it. */
   needsReconnect: boolean;
   reconnectReason: string | null;
+  /** Set by the dashboard's Disconnect button; cleared on reconnect. */
+  disconnectedAt: number | null;
 }
 
 export interface Campaign {
@@ -144,7 +146,8 @@ export async function upsertAccount(
          token_expires_at = excluded.token_expires_at,
          last_refreshed_at = excluded.last_refreshed_at,
          needs_reconnect = 0,
-         reconnect_reason = NULL`,
+         reconnect_reason = NULL,
+         disconnected_at = NULL`,
     )
     .bind(account.igUserId, account.username, encrypted, expiresAt, now, now)
     .run();
@@ -184,6 +187,7 @@ export async function accountsDueForRefresh(
       `SELECT ig_user_id, username, token_expires_at, last_refreshed_at, connected_at
        FROM accounts
        WHERE needs_reconnect = 0
+         AND disconnected_at IS NULL
          AND (
            (token_expires_at IS NOT NULL AND token_expires_at < ?)
            OR (token_expires_at IS NULL
@@ -252,6 +256,7 @@ export async function accountsToReconcile(
       `SELECT a.ig_user_id, a.username
        FROM accounts a
        WHERE a.needs_reconnect = 0
+         AND a.disconnected_at IS NULL
          AND EXISTS (SELECT 1 FROM campaigns c
                       WHERE c.ig_user_id = a.ig_user_id AND c.active = 1)
        ORDER BY a.username`,
@@ -309,7 +314,7 @@ export async function listAccounts(db: D1Database): Promise<Account[]> {
   const { results } = await db
     .prepare(
       `SELECT ig_user_id, username, token_expires_at, connected_at,
-              needs_reconnect, reconnect_reason
+              needs_reconnect, reconnect_reason, disconnected_at
        FROM accounts ORDER BY username`,
     )
     .all<{
@@ -319,6 +324,7 @@ export async function listAccounts(db: D1Database): Promise<Account[]> {
       connected_at: number;
       needs_reconnect: number;
       reconnect_reason: string | null;
+      disconnected_at: number | null;
     }>();
 
   return results.map((r) => ({
@@ -328,11 +334,30 @@ export async function listAccounts(db: D1Database): Promise<Account[]> {
     connectedAt: r.connected_at,
     needsReconnect: r.needs_reconnect === 1,
     reconnectReason: r.reconnect_reason,
+    disconnectedAt: r.disconnected_at,
   }));
 }
 
-export async function deleteAccount(db: D1Database, igUserId: string): Promise<void> {
-  await db.prepare(`DELETE FROM accounts WHERE ig_user_id = ?`).bind(igUserId).run();
+/**
+ * Disconnects an account without deleting its row — deleting it cascaded
+ * through campaigns.ig_user_id ON DELETE CASCADE and took every campaign with
+ * it (see migration 0014). Flips a flag and deactivates its campaigns
+ * instead, so reconnecting the same ig_user_id finds the row, and its
+ * campaigns, right where they were.
+ */
+export async function disconnectAccount(db: D1Database, igUserId: string): Promise<void> {
+  // Batched, so the flag and the deactivation land in one transaction. As two
+  // statements the second could fail on its own and leave an account marked
+  // disconnected while its campaigns kept matching comments — a disconnect that
+  // reads as done in the dashboard and is still live at the webhook.
+  await db.batch([
+    db
+      .prepare(`UPDATE accounts SET disconnected_at = ? WHERE ig_user_id = ?`)
+      .bind(Date.now(), igUserId),
+    db
+      .prepare(`UPDATE campaigns SET active = 0 WHERE ig_user_id = ? AND active = 1`)
+      .bind(igUserId),
+  ]);
 }
 
 /* ---------------------------------------------------------------- settings */
@@ -706,6 +731,9 @@ export async function savePostStats(
     mediaType: string | null;
   },
 ): Promise<void> {
+  // One clock reading for both writes, so the snapshot's observed_at and the
+  // cache's fetched_at can never disagree about when this sweep happened.
+  const now = Date.now();
   await db
     .prepare(
       `INSERT INTO post_stats
@@ -731,7 +759,77 @@ export async function savePostStats(
       s.skipRate, s.avgWatchMs,
       s.totalWatchMs ?? null, s.interactions ?? null, s.reposts ?? null,
       s.follows ?? null, s.profileVisits ?? null,
-      s.permalink, s.caption, s.thumbnailUrl, s.mediaType, Date.now(),
+      s.permalink, s.caption, s.thumbnailUrl, s.mediaType, now,
+    )
+    .run();
+
+  await appendStatsSnapshot(db, mediaId, now, s);
+}
+
+/**
+ * Append one row to the time series, but only when something actually moved.
+ *
+ * The upsert above is destructive by design — `post_stats` answers "where is this
+ * post now" and only ever needs one row. This keeps the readings it overwrites,
+ * which is what makes it possible to compare two posts at the same AGE instead of
+ * comparing a fresh post against a settled one.
+ *
+ * The `NOT EXISTS` guard compares against the post's most recent snapshot and
+ * skips the insert when every metric matches. That is what stops a two-year-old
+ * post accruing an identical row every hour forever: rows accumulate while a post
+ * is moving and stop by themselves once it settles, so there is no retention job
+ * to write and no pruning cron to forget about. `IS` rather than `=` throughout,
+ * because these columns are routinely NULL (Meta's "in development" reel metrics
+ * drop out at random) and `NULL = NULL` is NULL, which would defeat the guard and
+ * insert a duplicate row every single sweep.
+ */
+export async function appendStatsSnapshot(
+  db: D1Database,
+  mediaId: string,
+  observedAt: number,
+  s: {
+    views: number | null;
+    reach: number | null;
+    skipRate: number | null;
+    avgWatchMs: number | null;
+    totalWatchMs?: number | null;
+    interactions?: number | null;
+    likes: number | null;
+    comments: number | null;
+    saved: number | null;
+    shares: number | null;
+  },
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO post_stats_history
+         (media_id, observed_at, age_ms, views, reach, skip_rate, avg_watch_ms,
+          total_watch_ms, interactions, likes, comments, saved, shares)
+       SELECT ?1, ?2,
+              (SELECT ?2 - m.posted_at FROM account_media m WHERE m.media_id = ?1),
+              ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+       WHERE NOT EXISTS (
+         SELECT 1 FROM post_stats_history h
+         WHERE h.media_id = ?1
+           AND h.observed_at = (
+             SELECT MAX(observed_at) FROM post_stats_history WHERE media_id = ?1)
+           AND h.views IS ?3 AND h.reach IS ?4 AND h.skip_rate IS ?5
+           AND h.avg_watch_ms IS ?6 AND h.total_watch_ms IS ?7
+           AND h.interactions IS ?8 AND h.likes IS ?9 AND h.comments IS ?10
+           AND h.saved IS ?11 AND h.shares IS ?12
+       )
+       ON CONFLICT (media_id, observed_at) DO UPDATE SET
+         views = excluded.views, reach = excluded.reach,
+         skip_rate = excluded.skip_rate, avg_watch_ms = excluded.avg_watch_ms,
+         total_watch_ms = excluded.total_watch_ms, interactions = excluded.interactions,
+         likes = excluded.likes, comments = excluded.comments,
+         saved = excluded.saved, shares = excluded.shares`,
+    )
+    .bind(
+      mediaId, observedAt,
+      s.views, s.reach, s.skipRate, s.avgWatchMs,
+      s.totalWatchMs ?? null, s.interactions ?? null,
+      s.likes, s.comments, s.saved, s.shares,
     )
     .run();
 }
@@ -748,31 +846,63 @@ export async function staleRecentMediaStats(
   limit: number,
   maxAgeMs = CACHE_TTL_MS,
 ): Promise<Array<{ mediaId: string; igUserId: string }>> {
+  // Zero means the caller is overriding the cache, not describing a short one.
+  // Compared as `fetched_at < now` it excludes a row stamped this millisecond,
+  // which is the one row a manual refresh most wants — see the matching note in
+  // refreshStaleAccountMedia.
+  const ignoreCache = maxAgeMs <= 0;
   const cutoff = Date.now() - maxAgeMs;
+  // A disconnected account keeps its rows (migration 0014 never deletes them),
+  // so without this filter its old posts stay permanently stale and the sweep
+  // spends its whole per-run budget calling Meta with a token the operator has
+  // already revoked. LEFT JOIN rather than an inner one: media whose account row
+  // is genuinely gone still belongs in the list, and `disconnected_at IS NULL`
+  // is true for that case too.
   const { results } = await db
     .prepare(
       `SELECT m.media_id AS mediaId, m.ig_user_id AS igUserId
        FROM account_media m
        LEFT JOIN post_stats p ON p.media_id = m.media_id
-       WHERE p.fetched_at IS NULL OR p.fetched_at < ?
+       LEFT JOIN accounts a ON a.ig_user_id = m.ig_user_id
+       WHERE a.disconnected_at IS NULL
+         AND (?1 OR p.fetched_at IS NULL OR p.fetched_at < ?2)
        ORDER BY m.posted_at DESC
-       LIMIT ?`,
+       LIMIT ?3`,
     )
-    .bind(cutoff, limit)
+    .bind(ignoreCache ? 1 : 0, cutoff, limit)
     .all<{ mediaId: string; igUserId: string }>();
   return results;
 }
 
 /**
- * The full stats table the MCP endpoint serves — every post in the cache with
- * whatever numbers the sweep has for it. Reads only what the runbook's manual
- * query read; the endpoint holding this must never grow a write.
+ * The shortcode out of a permalink — `.../reel/ABC123/` and `.../p/ABC123/` both
+ * yield `ABC123`. It is the key the editorial layer uses (see post_notes), because
+ * it survives a post being deleted and a human can read it off a URL.
+ */
+export function shortcodeFromPermalink(permalink: string | null): string {
+  const m = /\/(?:reel|p|tv)\/([^/?#]+)/.exec(permalink ?? "");
+  return m ? m[1] : "";
+}
+
+/**
+ * The full stats table the MCP endpoint and /stats.json serve.
+ *
+ * Every column the sweep collects, plus the editorial note for that post.
+ *
+ * Five columns were being written and never read until 2026-08-12 —
+ * total_watch_ms, interactions, reposts, follows and profile_visits were absent
+ * from this SELECT, so nothing downstream had ever seen them despite the sweep
+ * having stored them since early August. total_watch_ms in particular is the one
+ * metric here that is neither a rate nor an average, which makes it the only
+ * honest way to compare a short post against a long one.
  */
 export async function postStatsReport(db: D1Database, limit: number) {
   const { results } = await db
     .prepare(
-      `SELECT m.permalink, m.caption, m.posted_at AS postedAt,
+      `SELECT m.permalink, m.caption, m.posted_at AS postedAt, m.media_type AS mediaType,
               p.views, p.reach, p.skip_rate AS skipRate, p.avg_watch_ms AS avgWatchMs,
+              p.total_watch_ms AS totalWatchMs, p.interactions, p.reposts,
+              p.follows, p.profile_visits AS profileVisits,
               p.likes, p.comments, p.saved, p.shares
        FROM account_media m
        LEFT JOIN post_stats p ON p.media_id = m.media_id
@@ -780,6 +910,129 @@ export async function postStatsReport(db: D1Database, limit: number) {
        LIMIT ?`,
     )
     .bind(limit)
+    .all<Record<string, unknown>>();
+
+  // The note is attached in TS rather than SQL because post_notes is keyed by
+  // shortcode and account_media by media_id; deriving the shortcode here is the
+  // same work as doing it in SQLite string functions, and legible.
+  const notes = await postNotes(db);
+  return results.map((r) => ({
+    ...r,
+    note: notes[shortcodeFromPermalink(r.permalink as string | null)] ?? null,
+  }));
+}
+
+/* ------------------------------------------------------- editorial notes */
+
+export interface PostNote {
+  fmt: string | null;
+  status: string | null;
+  pill: string | null;
+  why: string | null;
+  updatedAt: number;
+}
+
+/** Every judgement, keyed by shortcode. Small table — one row per post ever. */
+export async function postNotes(db: D1Database): Promise<Record<string, PostNote>> {
+  const { results } = await db
+    .prepare(
+      `SELECT shortcode, fmt, status, pill, why, updated_at AS updatedAt FROM post_notes`,
+    )
+    .all<{ shortcode: string } & PostNote>();
+  const out: Record<string, PostNote> = {};
+  for (const { shortcode, ...note } of results) out[shortcode] = note;
+  return out;
+}
+
+/**
+ * Write one judgement. Upsert, because re-judging a post is the normal case —
+ * a verdict written at 24h should be replaced at day 7, not appended to.
+ */
+export async function savePostNote(
+  db: D1Database,
+  shortcode: string,
+  n: { fmt?: string | null; status?: string | null; pill?: string | null; why?: string | null },
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO post_notes (shortcode, fmt, status, pill, why, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (shortcode) DO UPDATE SET
+         fmt = excluded.fmt, status = excluded.status,
+         pill = excluded.pill, why = excluded.why,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(shortcode, n.fmt ?? null, n.status ?? null, n.pill ?? null, n.why ?? null, Date.now())
+    .run();
+}
+
+/* --------------------------------------------------------- time series */
+
+/**
+ * Every post's reading nearest a given age, so posts can be compared at the same
+ * point in their life instead of "whatever each one happens to be at now".
+ *
+ * `toleranceMs` bounds how far from the requested age a snapshot may sit and
+ * still count — without it, a post whose nearest reading is four days off the
+ * 24-hour mark would silently answer a question about its first day. Posts with
+ * no snapshot inside the tolerance are omitted rather than approximated: this
+ * table starts empty on 2026-08-12, so for a while most posts have no early
+ * history at all and a guess would be indistinguishable from a measurement.
+ */
+export async function statsAtAge(
+  db: D1Database,
+  ageMs: number,
+  toleranceMs: number,
+  limit = 48,
+) {
+  const { results } = await db
+    .prepare(
+      `SELECT m.permalink, m.posted_at AS postedAt, h.observed_at AS observedAt,
+              h.age_ms AS ageMs, h.views, h.reach, h.skip_rate AS skipRate,
+              h.avg_watch_ms AS avgWatchMs, h.total_watch_ms AS totalWatchMs,
+              h.interactions, h.likes, h.comments, h.saved, h.shares
+       FROM account_media m
+       JOIN post_stats_history h ON h.media_id = m.media_id
+       WHERE h.age_ms IS NOT NULL
+         AND ABS(h.age_ms - ?1) <= ?2
+         AND ABS(h.age_ms - ?1) = (
+           SELECT MIN(ABS(h2.age_ms - ?1)) FROM post_stats_history h2
+           WHERE h2.media_id = m.media_id AND h2.age_ms IS NOT NULL)
+       GROUP BY m.media_id
+       ORDER BY m.posted_at DESC
+       LIMIT ?3`,
+    )
+    .bind(ageMs, toleranceMs, limit)
+    .all();
+  return results;
+}
+
+/**
+ * Escapes the LIKE wildcards in a value that is meant to match literally.
+ *
+ * Instagram shortcodes are drawn from `[A-Za-z0-9_-]`, so roughly one in five
+ * carries an underscore — which LIKE reads as "any single character". Unescaped,
+ * `Dbi3lYEJ_-s` also matches `Dbi3lYEJx-s`, and the trajectory returned would be
+ * two posts' readings interleaved with nothing to say so.
+ */
+function likeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+/** The whole curve for one post, oldest reading first. */
+export async function postTrajectory(db: D1Database, shortcode: string) {
+  const { results } = await db
+    .prepare(
+      `SELECT h.observed_at AS observedAt, h.age_ms AS ageMs, h.views, h.reach,
+              h.skip_rate AS skipRate, h.avg_watch_ms AS avgWatchMs,
+              h.total_watch_ms AS totalWatchMs, h.interactions,
+              h.likes, h.comments, h.saved, h.shares
+       FROM post_stats_history h
+       JOIN account_media m ON m.media_id = h.media_id
+       WHERE m.permalink LIKE '%/' || ?1 || '/%' ESCAPE '\\'
+       ORDER BY h.observed_at ASC`,
+    )
+    .bind(likeLiteral(shortcode))
     .all();
   return results;
 }
@@ -788,7 +1041,7 @@ export async function postStatsReport(db: D1Database, limit: number) {
 
 /** Sections the workspace page keeps. Anything else is rejected at the route, so
  *  a stray client can't grow this table a row at a time. */
-export const WORKSPACE_SECTIONS = ["queue", "actions", "backlog", "miles", "ideas"];
+export const WORKSPACE_SECTIONS = ["queue", "actions", "backlog", "miles", "ideas", "chats"];
 
 /** Every stored section, shaped for the page's reconcile loop:
  *  `{ queue: { value, updatedAt }, … }`. Missing sections are simply absent —
@@ -1051,4 +1304,128 @@ export async function sendStats(
   }
   stats.sent += stats.recovered;
   return stats;
+}
+
+/* ---------------------------------------------------------------- dm inbox */
+
+export interface DMIdea {
+  mid: string;
+  igUserId: string;
+  senderId: string;
+  recipientId: string | null;
+  isEcho: boolean;
+  text: string | null;
+  attachmentType: string | null;
+  sharedUrl: string | null;
+  sharedMediaId: string | null;
+  receivedAt: number;
+  processedAt: number | null;
+}
+
+/**
+ * The operator's own account ids. Not derived from `accounts`: the account they
+ * send ideas FROM has no token here, so it has no row there — filtering on the
+ * accounts table would drop exactly the messages this feature exists to keep.
+ */
+export async function selfAccountIds(db: D1Database): Promise<string[]> {
+  const row = await db
+    .prepare(`SELECT value FROM settings WHERE key = 'dm_self_ids'`)
+    .first<{ value: string }>();
+
+  return (row?.value ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s !== "");
+}
+
+/**
+ * Stores one self-sent DM. `INSERT OR IGNORE` on the message id because Meta
+ * retries any delivery it doesn't get a prompt 200 for, and the same idea
+ * arriving twice must not become two rows.
+ */
+export async function recordDMIdea(
+  db: D1Database,
+  idea: Omit<DMIdea, "processedAt"> & { rawJson: string },
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT OR IGNORE INTO dm_inbox
+         (mid, ig_user_id, sender_id, recipient_id, is_echo, text,
+          attachment_type, shared_url, shared_media_id, raw_json, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      idea.mid,
+      idea.igUserId,
+      idea.senderId,
+      idea.recipientId,
+      idea.isEcho ? 1 : 0,
+      idea.text,
+      idea.attachmentType,
+      idea.sharedUrl,
+      idea.sharedMediaId,
+      idea.rawJson,
+      idea.receivedAt,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function listDMIdeas(
+  db: D1Database,
+  opts: { limit?: number; openOnly?: boolean } = {},
+): Promise<DMIdea[]> {
+  const limit = Math.min(Math.max(opts.limit ?? 25, 1), 200);
+  const { results } = await db
+    .prepare(
+      `SELECT mid, ig_user_id, sender_id, recipient_id, is_echo, text,
+              attachment_type, shared_url, shared_media_id, received_at, processed_at
+         FROM dm_inbox
+        ${opts.openOnly ? "WHERE processed_at IS NULL" : ""}
+        ORDER BY received_at DESC
+        LIMIT ?`,
+    )
+    .bind(limit)
+    .all<{
+      mid: string;
+      ig_user_id: string;
+      sender_id: string;
+      recipient_id: string | null;
+      is_echo: number;
+      text: string | null;
+      attachment_type: string | null;
+      shared_url: string | null;
+      shared_media_id: string | null;
+      received_at: number;
+      processed_at: number | null;
+    }>();
+
+  return results.map((r) => ({
+    mid: r.mid,
+    igUserId: r.ig_user_id,
+    senderId: r.sender_id,
+    recipientId: r.recipient_id,
+    isEcho: r.is_echo === 1,
+    text: r.text,
+    attachmentType: r.attachment_type,
+    sharedUrl: r.shared_url,
+    sharedMediaId: r.shared_media_id,
+    receivedAt: r.received_at,
+    processedAt: r.processed_at,
+  }));
+}
+
+/** Marks an idea as folded into the queue so the next read skips it. */
+export async function markDMIdeaProcessed(
+  db: D1Database,
+  mid: string,
+  at: number,
+): Promise<boolean> {
+  const result = await db
+    .prepare(`UPDATE dm_inbox SET processed_at = ? WHERE mid = ? AND processed_at IS NULL`)
+    .bind(at, mid)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
 }

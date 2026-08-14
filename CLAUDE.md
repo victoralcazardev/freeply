@@ -108,12 +108,24 @@ open. It's reproduced from README step 2 — if you edit it, edit it there too.
 > 6. IMPORTANT — this panel has its OWN app ID and secret, different from App settings →
 >    Basic. Tell me the "Instagram app ID" and confirm you can see an "Instagram app
 >    secret" field, but do NOT reveal the secret.
-> 7. Leave the default permissions (instagram_business_basic,
->    instagram_business_manage_comments, instagram_business_manage_messages) and make
->    sure instagram_business_manage_insights is there too — it's requested
->    unconditionally, so leaving it out yields a token missing a scope the code asks
->    for. Tell me if the panel won't let you add it. Do NOT add
->    instagram_business_content_publish.
+> 7. The permissions must match `SCOPES` in `src/instagram.ts` exactly — all five of
+>    instagram_business_basic, instagram_business_manage_comments,
+>    instagram_business_manage_messages, instagram_business_manage_insights,
+>    instagram_business_content_publish. Every one is requested unconditionally, and
+>    a scope the code asks for that the app can't grant is the suspected cause of a
+>    consent screen that dies with "We couldn't connect to Instagram" *after* login —
+>    Instagram doesn't check the scope list until it builds that screen, so the
+>    authorize URL looks fine right up until it isn't.
+>
+>    Watch the prefix. `instagram_manage_comments` and `instagram_business_manage_comments`
+>    are different permissions for different login flows; only the `_business_` ones
+>    belong to Instagram Login for Business, and the pair sit next to each other in
+>    the list reading almost identically. Tell me if the panel won't let you add any
+>    of the five, and tell me which ones show a status badge.
+>
+>    Add nothing else. Extra permissions are not free: each one is another thing that
+>    can fail that consent screen, most of the list needs App Review, and rule 5
+>    applies — widening scope is how a single-tenant app gets restricted.
 > 8. Roles tab → add my Instagram account as an **Instagram Tester**. Ask me for the
 >    username. This must happen before any token is generated.
 > 9. App settings → Basic: tell me the Meta App ID. Do not click "Show" on the secret.
@@ -243,7 +255,7 @@ Don't report success until a DM has landed in a real inbox.
 ## Working on the code
 
 ```bash
-npm test            # 161 tests, workerd + real D1 + a real Durable Object
+npm test            # 260 tests, workerd + real D1 + a real Durable Object
 npm run typecheck
 ```
 
@@ -269,6 +281,26 @@ in review if you don't already know:
 - An account has two IDs. Webhooks and the messages endpoint use the Instagram Business
   `user_id` (the `17841…` form), not the app-scoped `id`. Match the wrong one and
   nothing routes, quietly.
+
+**The dashboard never waits on Instagram.** `renderDashboard` reads D1, returns, and
+queues the Graph refreshes with `ctx.waitUntil` — do not put an `await` back in front
+of them. It rendered synchronously until 2026-08-07, which meant a stale cache cost a
+round trip to Meta and a refused token cost a *failing* one, and a failing call is the
+slow one. What that bought was numbers a few minutes newer on first paint; what it cost
+was every page load. The overview prints how old its numbers are (`cacheAge`), and
+`POST /refresh` is still synchronous because it is a button someone pressed.
+
+Two rules follow. Graph **reads** carry `AbortSignal.timeout` (`timed()` in
+`src/instagram.ts`) — `fetch` in a Worker has no default timeout, so an endpoint that
+stalls stalls the isolate; the publish path is exempt on purpose. And background work
+goes through `inBackground()`, because a throw inside `waitUntil` logs an unhandled
+rejection against a request that already returned 200.
+
+**`maxAgeMs` of 0 means "ignore the cache", not "a zero-length cache".** Both sweep
+helpers special-case it instead of comparing against `Date.now()`. A stamp written in
+the same millisecond ties with the cutoff and reads as fresh, so `Refresh now` could
+sweep nothing — rare in a browser, constant in tests, and the reason
+`manual-refresh.test.ts` was flaky until 2026-08-07.
 
 **Migrations** are numbered and additive: add `migrations/NNNN_name.sql`, never edit one
 that has been applied. `npm run setup` applies them.

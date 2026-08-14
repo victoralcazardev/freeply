@@ -1,6 +1,31 @@
+// v23.0 on purpose, and tested: v26.0 (the newest version Meta recognises as of
+// 2026-08-12; v27+ answers "Unknown path components") returns byte-identical
+// errors for every metric this file asks for. The version is not a variable —
+// re-bumping it is a tested dead end, receipts in the comments below.
 const API_VERSION = "v23.0";
 const GRAPH_HOST = "https://graph.instagram.com";
 const OAUTH_HOST = "https://api.instagram.com";
+
+/**
+ * Ceiling on a single Graph read.
+ *
+ * `fetch` in a Worker has no default timeout, so a Meta endpoint that stalls
+ * stalls whoever is waiting on it — and until the dashboard stopped awaiting
+ * these, that was the page render itself. Ten seconds is far past a healthy
+ * call (a few hundred ms) and far short of a visitor giving up.
+ *
+ * Nothing downstream needs new handling: every read below already treats a
+ * throw as "this metric is unavailable", and an abort arrives as a throw. The
+ * token exchange and the publish path are deliberately left uncapped — a
+ * publish is a user action that already failed loudly, and a half-aborted
+ * container create is worse than a slow one.
+ */
+const GRAPH_TIMEOUT_MS = 10_000;
+
+/** Request init that aborts a stalled Graph read instead of waiting forever. */
+function timed(init: RequestInit = {}): RequestInit {
+  return { ...init, signal: AbortSignal.timeout(GRAPH_TIMEOUT_MS) };
+}
 
 /**
  * Meta's private-reply docs list only basic + manage_comments, but a token with
@@ -16,6 +41,10 @@ export const SCOPES = [
   // saw the post rather than in isolation. Requested now because scope changes
   // only take effect on a fresh authorization.
   "instagram_business_manage_insights",
+  // Publishing reels from the Kuff app (see src/channel.ts). Standard Access
+  // covers it for accounts the operator has a role on, the same as every other
+  // scope here — no App Review, because this stays single-tenant.
+  "instagram_business_content_publish",
 ];
 
 export function authorizeUrl(clientId: string, redirectUri: string): string {
@@ -70,24 +99,65 @@ export async function exchangeCodeForToken(
     return { ok: false, error: `code exchange failed (${shortRes.status}): ${shortBody.slice(0, 300)}` };
   }
 
-  let short: { access_token?: string; user_id?: string | number; error_message?: string };
+  let short: {
+    access_token?: string;
+    user_id?: string | number;
+    error_message?: string;
+    /**
+     * Instagram Login for Business wraps the first hop's result in `data[0]`
+     * rather than returning it flat, and which shape you get has moved with the
+     * API. Read both: a flat response that suddenly nests is otherwise a
+     * "no access_token in response" with a perfectly valid token inside it.
+     */
+    data?: Array<{ access_token?: string; user_id?: string | number; permissions?: unknown }>;
+  };
   try {
     short = JSON.parse(shortBody);
   } catch {
     return { ok: false, error: `code exchange returned non-JSON: ${shortBody.slice(0, 200)}` };
   }
-  if (!short.access_token) {
+
+  const shortToken = short.access_token ?? short.data?.[0]?.access_token;
+  const shortUserId = short.user_id ?? short.data?.[0]?.user_id;
+
+  // Shape only — never the token, never the secret. Enough to tell a nested
+  // response from a flat one, and a real token from a stringified object,
+  // without any of it being usable if a log is ever read by the wrong person.
+  console.log(
+    "code exchange ok:",
+    JSON.stringify({
+      keys: Object.keys(short),
+      nested: Array.isArray(short.data),
+      tokenLength: shortToken?.length ?? 0,
+      looksLikeIgToken: typeof shortToken === "string" && shortToken.startsWith("IGAA"),
+      hasUserId: shortUserId !== undefined,
+    }),
+  );
+
+  if (!shortToken) {
     return { ok: false, error: short.error_message ?? "no access_token in response" };
   }
 
   const longUrl = new URL(`${GRAPH_HOST}/access_token`);
   longUrl.searchParams.set("grant_type", "ig_exchange_token");
   longUrl.searchParams.set("client_secret", clientSecret);
-  longUrl.searchParams.set("access_token", short.access_token);
+  longUrl.searchParams.set("access_token", shortToken);
 
   const longRes = await fetch(longUrl);
   const longBody = await longRes.text();
   if (!longRes.ok) {
+    // Logged with the secret and token stripped, because the failure we chased
+    // on 2026-08-07 ("Unsupported request - method type: get") was impossible to
+    // tell apart from a malformed URL without seeing what was actually sent.
+    console.error(
+      "long-lived exchange failed:",
+      JSON.stringify({
+        status: longRes.status,
+        url: `${longUrl.origin}${longUrl.pathname}?grant_type=${longUrl.searchParams.get("grant_type")}`,
+        secretLength: clientSecret.length,
+        body: longBody.slice(0, 300),
+      }),
+    );
     return { ok: false, error: `long-lived exchange failed (${longRes.status}): ${longBody.slice(0, 300)}` };
   }
 
@@ -107,7 +177,7 @@ export async function exchangeCodeForToken(
     ok: true,
     account: {
       accessToken: long.access_token,
-      userId: me?.userId ?? String(short.user_id ?? ""),
+      userId: me?.userId ?? String(shortUserId ?? ""),
       username: me?.username,
       expiresIn: long.expires_in,
     },
@@ -300,7 +370,16 @@ export async function getMe(accessToken: string): Promise<Me | null> {
   url.searchParams.set("fields", "id,user_id,username");
   url.searchParams.set("access_token", accessToken);
 
-  const res = await fetch(url);
+  // Wrapped because the timeout above turns a stalled call into a throw, and
+  // this function's contract is already "null means we couldn't read it" — an
+  // uncaught abort here would 500 the OAuth callback instead.
+  let res: Response;
+  try {
+    res = await fetch(url, timed());
+  } catch (cause) {
+    console.error("graph GET /me failed:", cause);
+    return null;
+  }
   if (!res.ok) return null;
   try {
     const d = (await res.json()) as { id?: string; user_id?: string; username?: string };
@@ -386,20 +465,37 @@ export async function getMediaStats(
   );
   metaUrl.searchParams.set("access_token", accessToken);
 
-  let insightsRes: Response;
-  let metaRes: Response;
-  try {
-    [insightsRes, metaRes] = await Promise.all([fetch(insightsUrl), fetch(metaUrl)]);
-  } catch (cause) {
+  // allSettled, not all: `all` rejects on the first failure and abandons the
+  // other request, whose body is then never read — the exact leak the drain
+  // below exists to prevent, reintroduced on the one path where a call times
+  // out. Settling both means whichever one arrived can still be cancelled.
+  const [insights, meta] = await Promise.allSettled([
+    fetch(insightsUrl, timed()),
+    fetch(metaUrl, timed()),
+  ]);
+  if (insights.status === "rejected" || meta.status === "rejected") {
+    if (insights.status === "fulfilled") await insights.value.body?.cancel().catch(() => {});
+    if (meta.status === "fulfilled") await meta.value.body?.cancel().catch(() => {});
     // A network-level throw here used to escape uncaught and 500 whatever was
     // blocking on the sweep — the overview render included. Same soft-fail
     // contract as getJson: this post stays blank, everything else proceeds.
-    console.error(`media stats fetch failed for ${mediaId}:`, cause);
+    console.error(
+      `media stats fetch failed for ${mediaId}:`,
+      insights.status === "rejected" ? insights.reason : (meta as PromiseRejectedResult).reason,
+    );
     return null;
   }
+  const insightsRes = insights.value;
+  const metaRes = meta.value;
 
   if (!insightsRes.ok) {
     console.error(`insights failed for ${mediaId}:`, (await insightsRes.text()).slice(0, 200));
+    // metaRes is abandoned on this path — drain it. An unread body holds one of
+    // the isolate's limited concurrent connections open forever, and the runtime
+    // "prevents deadlock" by cancelling the OLDEST unread response, i.e. some
+    // OTHER post's in-flight request. That cancellation is where the sweep's
+    // random nulls (product type, skip/watch) were coming from.
+    await metaRes.body?.cancel().catch(() => {});
     return null;
   }
 
@@ -427,6 +523,10 @@ export async function getMediaStats(
     } catch {
       // Presentation only — its absence shouldn't lose the metrics.
     }
+  } else {
+    // Same rule as above: every response gets read or cancelled, no exceptions.
+    // This unread error body was the other leak feeding the stall-canceller.
+    console.error(`media fields failed for ${mediaId}:`, (await metaRes.text()).slice(0, 200));
   }
 
   // Meta flags both reel metrics "in development"; they come and go. A failure
@@ -447,7 +547,7 @@ export async function getMediaStats(
     );
     reelUrl.searchParams.set("access_token", accessToken);
     try {
-      const reelRes = await fetch(reelUrl);
+      const reelRes = await fetch(reelUrl, timed());
       if (reelRes.ok) {
         const body = (await reelRes.json()) as { data?: InsightRow[] };
         skipRate = pickMetric(body.data, "reels_skip_rate");
@@ -472,61 +572,64 @@ export async function getMediaStats(
     }
   }
 
-  // follows / profile_visits: the growth pair. Whether REELS supports them is exactly
-  // the open question — a scraped doc table said feed-and-story only, Instagram's own
-  // Help Center describes Follows as a reel insight, and neither is this account.
-  //
-  // Deliberately its OWN request, not appended to the reel metrics above: if Meta
-  // rejects a metric the entire request fails, and that request is currently the only
-  // source of skip rate and watch time. An unproven metric must not be able to take
-  // working ones down with it. On rejection Meta names the offending metric in the
-  // error body — that response is the answer, so it gets logged verbatim.
+  // follows / profile_visits: the growth pair. SETTLED 2026-08-12, singly, on the
+  // account's own posts — not from docs and not from a batched request:
+  //   · REELS  + metric=follows          → "does not support the follows metric
+  //     for this media product type" (same for profile_visits alone, same with
+  //     metric_type=total_value, same on v23.0 and v26.0)
+  //   · CAROUSEL/feed + the pair         → 200, follows=1, profile_visits=0
+  // So: valid metric names, live token, one unsupported product type. The app's
+  // per-reel Follows screen reads Instagram's private internals, which hard rule
+  // 9 puts permanently off the table. Skipping REELS here is not giving up on
+  // the metric — it is declining to pay one guaranteed-400 per reel per sweep.
   let follows: number | null = null;
   let profileVisits: number | null = null;
-  try {
-    const growthUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}/insights`);
-    growthUrl.searchParams.set("metric", "follows,profile_visits");
-    growthUrl.searchParams.set("access_token", accessToken);
-    const growthRes = await fetch(growthUrl);
-    if (growthRes.ok) {
-      const body = (await growthRes.json()) as { data?: InsightRow[] };
-      follows = pickMetric(body.data, "follows");
-      profileVisits = pickMetric(body.data, "profile_visits");
-    } else {
-      console.log(
-        `growth metrics rejected for ${mediaId} (${mediaProductType}):`,
-        (await growthRes.text()).slice(0, 300),
-      );
+  if (mediaProductType && mediaProductType !== "REELS") {
+    try {
+      const growthUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}/insights`);
+      growthUrl.searchParams.set("metric", "follows,profile_visits");
+      growthUrl.searchParams.set("access_token", accessToken);
+      const growthRes = await fetch(growthUrl, timed());
+      if (growthRes.ok) {
+        const body = (await growthRes.json()) as { data?: InsightRow[] };
+        follows = pickMetric(body.data, "follows");
+        profileVisits = pickMetric(body.data, "profile_visits");
+      } else {
+        // Log the QUERY next to the error. A rejection is only evidence about the
+        // metric if you can see what was asked — reading one without the other is
+        // how "the API does not support this" once got claimed for a request that
+        // had never been checked.
+        const sent = new URLSearchParams(growthUrl.searchParams);
+        sent.delete("access_token");
+        console.log(
+          `growth metrics rejected for ${mediaId} (${mediaProductType}) [${sent}]:`,
+          (await growthRes.text()).slice(0, 300),
+        );
+      }
+    } catch {
+      // Same soft-fail contract as every other optional metric here.
     }
-  } catch {
-    // Same soft-fail contract as every other optional metric here.
   }
 
-  // reposts_count is a media FIELD, not an insights metric, and it's newer than the
-  // rest (April 2026). It gets its own request rather than joining the `fields` list
-  // above: an unsupported field there would fail that call, and that call is what
-  // resolves media_product_type — which gates the reel metrics. A flaky new field
-  // must not be able to silently switch off skip rate and watch time.
-  let reposts: number | null = null;
-  try {
-    const repostUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}`);
-    repostUrl.searchParams.set("fields", "reposts_count");
-    repostUrl.searchParams.set("access_token", accessToken);
-    const repostRes = await fetch(repostUrl);
-    if (repostRes.ok) {
-      const r = (await repostRes.json()) as { reposts_count?: number };
-      reposts = r.reposts_count ?? null;
-    } else {
-      // Most likely cause is API_VERSION: reposts_count landed in the April 2026
-      // update and this client is pinned to v23.0. Logged, not thrown.
-      console.log(
-        `reposts_count unavailable (${API_VERSION}) for ${mediaId}:`,
-        (await repostRes.text()).slice(0, 160),
-      );
-    }
-  } catch {
-    // Same soft-fail contract: no reposts is not a reason to lose everything else.
-  }
+  // reposts: SETTLED 2026-08-12 — this surface has no per-post repost number,
+  // and it is not a version problem. Tested, all 400: fields=reposts_count
+  // (v23.0 AND v26.0, "nonexisting field"), fields=reshare_count (same),
+  // metric=reposts, metric=reshares. The endpoint's own enum (leaked in full by
+  // probing an invalid metric name) was: impressions, shares, comments, likes,
+  // saved, replies, total_interactions, navigation, follows, profile_visits,
+  // profile_activity, reach, ig_reels_video_view_total_time,
+  // ig_reels_avg_watch_time, views, thread_replies, reposts, quotes,
+  // thread_shares, threads_views, threads_media_clicks, reels_skip_rate,
+  // threads_reposts, facebook_views, crossposted_views, total_views,
+  // total_likes, total_comments, link_clicks. "reposts" IS in that shared enum,
+  // but asking for it here answers "Instagram Insights Media API endpoint does
+  // not support the metrics: reposts" — endpoint-absolute wording, unlike the
+  // follows error, which is conditional on product type. Read together: the
+  // name belongs to another surface (note the Threads metrics around it), not
+  // to media insights. The column stays null until Meta ships it here — do NOT
+  // re-add a per-post request that 400s every sweep, and do not re-test the
+  // version; both are receipted dead ends.
+  const reposts: number | null = null;
 
   try {
     const body = (await insightsRes.json()) as { data?: InsightRow[] };
@@ -691,7 +794,7 @@ interface RawComment {
 async function getJson<T>(url: URL): Promise<T | null> {
   let res: Response;
   try {
-    res = await fetch(url);
+    res = await fetch(url, timed());
   } catch (cause) {
     console.error(`graph GET ${url.pathname} failed:`, cause);
     return null;
@@ -877,4 +980,213 @@ interface GraphError {
 interface GraphResponse {
   message_id?: string;
   error?: GraphError;
+}
+
+export interface PublishResult {
+  ok: boolean;
+  mediaId?: string;
+  permalink?: string;
+  error?: string;
+}
+
+/**
+ * How long to wait for Meta to finish transcoding before giving up.
+ *
+ * A container is not publishable the instant it is created — Meta downloads the
+ * video, transcodes it, and only then flips `status_code` to FINISHED. Calling
+ * media_publish before that returns "Media ID is not available", which reads
+ * like a bad ID rather than like "not yet". A minute covers a normal reel; past
+ * that something is wrong with the file and waiting longer will not fix it.
+ */
+const PUBLISH_POLL_ATTEMPTS = 20;
+const PUBLISH_POLL_INTERVAL_MS = 3_000;
+
+/**
+ * Publishes a reel: create a container, wait for it, publish it.
+ *
+ * `videoUrl` must be publicly reachable — Meta fetches the file itself, and a
+ * signed URL that expires mid-transcode fails the container rather than the
+ * publish. The resumable upload endpoint (rupload.facebook.com) exists for
+ * uploading bytes directly and is the alternative if hosting ever becomes the
+ * awkward part.
+ *
+ * Needs instagram_business_content_publish, which — like every other scope here
+ * — is only granted on a fresh authorization. See force_reauth in authorizeUrl.
+ * Standard Access covers it because these are the operator's own accounts,
+ * added as testers on their own app; that is the same reason nothing else here
+ * went through App Review.
+ */
+export async function publishReel(
+  accessToken: string,
+  post: { videoUrl: string; caption: string },
+): Promise<PublishResult> {
+  const createUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/me/media`);
+  const createBody = new URLSearchParams({
+    media_type: "REELS",
+    video_url: post.videoUrl,
+    caption: post.caption,
+    access_token: accessToken,
+  });
+
+  let container: { id?: string; error?: { message?: string } };
+  try {
+    const res = await fetch(createUrl, { method: "POST", body: createBody });
+    container = (await res.json()) as typeof container;
+  } catch (cause) {
+    console.error("reel container create failed:", cause);
+    return { ok: false, error: "could not reach Instagram" };
+  }
+  if (!container.id) {
+    return { ok: false, error: container.error?.message ?? "container was not created" };
+  }
+
+  const ready = await waitForContainer(accessToken, container.id);
+  if (!ready.ok) return ready;
+
+  const publishUrl = new URL(`${GRAPH_HOST}/${API_VERSION}/me/media_publish`);
+  const publishBody = new URLSearchParams({
+    creation_id: container.id,
+    access_token: accessToken,
+  });
+
+  let published: { id?: string; error?: { message?: string } };
+  try {
+    const res = await fetch(publishUrl, { method: "POST", body: publishBody });
+    published = (await res.json()) as typeof published;
+  } catch (cause) {
+    console.error("reel publish failed:", cause);
+    return { ok: false, error: "could not reach Instagram" };
+  }
+  if (!published.id) {
+    return { ok: false, error: published.error?.message ?? "publish was refused" };
+  }
+
+  // Best-effort. The post is live either way, and failing the whole call
+  // because the permalink lookup 500'd would have the caller believe nothing
+  // was posted — and try again, which is the one outcome worth avoiding.
+  const url = new URL(`${GRAPH_HOST}/${API_VERSION}/${published.id}`);
+  url.searchParams.set("fields", "permalink");
+  url.searchParams.set("access_token", accessToken);
+  const detail = await getJson<{ permalink?: string }>(url);
+
+  return { ok: true, mediaId: published.id, permalink: detail?.permalink };
+}
+
+async function waitForContainer(
+  accessToken: string,
+  containerId: string,
+): Promise<PublishResult> {
+  for (let attempt = 0; attempt < PUBLISH_POLL_ATTEMPTS; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, PUBLISH_POLL_INTERVAL_MS));
+
+    const url = new URL(`${GRAPH_HOST}/${API_VERSION}/${containerId}`);
+    url.searchParams.set("fields", "status_code,status");
+    url.searchParams.set("access_token", accessToken);
+
+    const body = await getJson<{ status_code?: string; status?: string }>(url);
+    // A failed read is not a failed publish — the poll is retried rather than
+    // treated as an error, because one flaky request should not abandon a video
+    // Meta is already transcoding.
+    if (!body) continue;
+
+    switch (body.status_code) {
+      case "FINISHED":
+        return { ok: true };
+      case "ERROR":
+        // `status` carries Meta's reason; `status_code` only says it failed.
+        return { ok: false, error: body.status ?? "Instagram rejected the video" };
+      case "EXPIRED":
+        return { ok: false, error: "the upload container expired before publishing" };
+      default:
+        continue; // IN_PROGRESS, or a code Meta has not documented.
+    }
+  }
+  return { ok: false, error: "Instagram did not finish processing the video in time" };
+}
+
+/** One message as the conversations API hands it back. */
+export interface ConversationMessage {
+  id: string;
+  createdTime: string | null;
+  fromId: string | null;
+  toId: string | null;
+  text: string;
+  raw: string;
+}
+
+/**
+ * The operator's DM threads, newest messages first.
+ *
+ * Two limits from Meta shape what this can return, and both are ceilings rather
+ * than page sizes — paginating harder does not beat either:
+ *
+ *   - only the 20 most recent messages in a thread are readable; older ids come
+ *     back as "message has been deleted"
+ *   - threads sitting in Requests with no activity for 30 days aren't returned
+ *
+ * So this is a one-time seed for whatever is still in reach, never the source of
+ * truth. The webhook recorder is what makes history complete going forward.
+ *
+ * Only the five documented message fields are requested. Attachments and shares
+ * are NOT — Meta documents no field name for them, and one invalid field fails
+ * the entire call rather than being ignored, which would turn a partial result
+ * into no result. Whatever does arrive is kept verbatim in `raw`.
+ */
+export async function fetchConversations(
+  accessToken: string,
+): Promise<{ ok: boolean; messages: ConversationMessage[]; error?: string }> {
+  const url = new URL(`${GRAPH_HOST}/${API_VERSION}/me/conversations`);
+  url.searchParams.set("fields", "id,messages{id,created_time,from,to,message}");
+  url.searchParams.set("access_token", accessToken);
+
+  let res: Response;
+  try {
+    res = await fetch(url, timed());
+  } catch (cause) {
+    console.error("graph GET /me/conversations failed:", cause);
+    return { ok: false, messages: [], error: "request failed or timed out" };
+  }
+
+  const body = await res.text();
+  if (!res.ok) {
+    // Never the URL: it carries the access token.
+    return { ok: false, messages: [], error: `conversations read failed (${res.status}): ${body.slice(0, 300)}` };
+  }
+
+  let parsed: {
+    data?: Array<{
+      id?: string;
+      messages?: {
+        data?: Array<{
+          id?: string;
+          created_time?: string;
+          from?: { id?: string };
+          to?: { data?: Array<{ id?: string }> };
+          message?: string;
+        }>;
+      };
+    }>;
+  };
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { ok: false, messages: [], error: "conversations returned non-JSON" };
+  }
+
+  const messages: ConversationMessage[] = [];
+  for (const conversation of parsed.data ?? []) {
+    for (const m of conversation.messages?.data ?? []) {
+      if (!m.id) continue;
+      messages.push({
+        id: m.id,
+        createdTime: m.created_time ?? null,
+        fromId: m.from?.id ?? null,
+        // `to` is a list even in a one-to-one thread.
+        toId: m.to?.data?.[0]?.id ?? null,
+        text: m.message ?? "",
+        raw: JSON.stringify(m),
+      });
+    }
+  }
+  return { ok: true, messages };
 }

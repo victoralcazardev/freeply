@@ -96,7 +96,8 @@ describe("GET /files/<key> ranges", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("accept-ranges")).toBe("bytes");
     expect(res.headers.get("content-range")).toBe(null);
-    expect(res.headers.get("cache-control")).toBe("private, max-age=3600");
+    // Authenticated media, so nothing may keep a copy that outlives the session.
+    expect(res.headers.get("cache-control")).toBe("no-store");
     expect(await body(res)).toBe(BODY);
   });
 });

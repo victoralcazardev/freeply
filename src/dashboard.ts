@@ -207,6 +207,16 @@ function alerts(accounts: Account[], shadowedCount: number): string {
   }
 
   for (const a of accounts) {
+    // Disconnected on purpose from Settings. Its campaigns are paused, not
+    // deleted — reconnecting picks the same row back up.
+    if (a.disconnectedAt) {
+      items.push(
+        `<b>@${esc(a.username)} is disconnected.</b> Its campaigns are paused.
+         <a href="/auth/start">Reconnect</a> to resume sending.`,
+      );
+      continue;
+    }
+
     // The cron gave up, so the countdown below is no longer the story — nothing
     // will renew this token and only a human can replace it.
     if (a.needsReconnect) {
@@ -307,6 +317,29 @@ export function dashboardPage(data: {
 
 /* ---------------------------------------------------------------- overview */
 
+/**
+ * How old the numbers on screen are.
+ *
+ * Worth a line of markup because the render no longer waits for Instagram: what
+ * you are looking at is the cache, and without a timestamp there is nothing to
+ * distinguish "these are current" from "the token died on Tuesday and these have
+ * been frozen since". The oldest post decides it — a table is only as fresh as
+ * its stalest row, and reporting the newest would flatter a half-refreshed set.
+ */
+function cacheAge(posts: PostPerformance[]): string {
+  const stamps = posts.map((p) => p.fetchedAt).filter((t): t is number => t !== null);
+  if (stamps.length === 0) return "";
+
+  const minutes = Math.floor((Date.now() - Math.min(...stamps)) / 60_000);
+  const ago =
+    minutes < 1
+      ? "just now"
+      : minutes < 60
+        ? `${minutes}m ago`
+        : `${Math.floor(minutes / 60)}h ago`;
+  return `<span class="muted small" style="margin-left:8px;font-weight:normal">as of ${ago}</span>`;
+}
+
 function overviewTab(
   stats: { sent: number; failed: number; duplicate: number },
   posts: PostPerformance[],
@@ -336,6 +369,7 @@ function overviewTab(
       <form method="post" action="/refresh" style="display:inline;margin-left:8px">
         <button class="small" title="Re-read posts and stats from Instagram right now, ignoring the cache">Refresh now</button>
       </form>
+      ${cacheAge(posts)}
     </h2>
     ${
       posts.length === 0
@@ -784,14 +818,19 @@ function settingsTab(accounts: Account[], campaigns: Campaign[]): string {
             .map(
               (a) => `<div class="card row">
                 <div><b>@${esc(a.username)}</b><br>
-                  <span class="small muted">${esc(a.igUserId)}</span> ${expiry(a)}</div>
+                  <span class="small muted">${esc(a.igUserId)}</span>
+                  ${a.disconnectedAt ? `<span class="tag warn">disconnected — campaigns paused</span>` : expiry(a)}</div>
                 <div style="display:flex;gap:.4rem">
                   <a href="/auth/start"><button class="small"
                      title="Re-runs authorization and replaces the stored access. Campaigns are kept.">Reconnect</button></a>
-                  <form method="post" action="/accounts/${esc(a.igUserId)}/delete"
-                        onsubmit="return confirm('Disconnect @${esc(a.username)}?\\n\\nThis DELETES its campaigns as well. To refresh expiring access or pick up new permissions, use Reconnect instead.')">
-                    <button class="danger small">Disconnect</button>
-                  </form>
+                  ${
+                    a.disconnectedAt
+                      ? ""
+                      : `<form method="post" action="/accounts/${esc(a.igUserId)}/delete"
+                               onsubmit="return confirm('Disconnect @${esc(a.username)}?\\n\\nIts campaigns are paused, not deleted — they resume once you reconnect.')">
+                           <button class="danger small">Disconnect</button>
+                         </form>`
+                  }
                 </div>
               </div>`,
             )

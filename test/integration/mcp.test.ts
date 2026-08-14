@@ -54,7 +54,16 @@ describe("/mcp", () => {
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as { result: { tools: Array<{ name: string }> } };
-    expect(body.result.tools.map((t) => t.name)).toEqual(["get_post_stats", "refresh_stats"]);
+    expect(body.result.tools.map((t) => t.name)).toEqual([
+      "get_post_stats",
+      "refresh_stats",
+      "set_post_note",
+      "get_stats_at_age",
+      "get_post_trajectory",
+      "list_dm_ideas",
+      "mark_dm_idea_processed",
+      "backfill_dm_ideas",
+    ]);
   });
 
   /**

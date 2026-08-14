@@ -41,14 +41,26 @@
   // Both jobs fail silently if nobody runs them — see src/cron.ts. Cron Triggers
   // are on the Cloudflare free plan; the free-plan cap is 5 per account, so these
   // two leave room. Times are UTC.
-  // A second custom domain can serve the same worker — the workspace page under
-  // its own hostname, say — and tracked links follow whichever host answered, so
-  // retiring one after DMs have gone out breaks the links already delivered.
-  // Keep an old hostname attached rather than 404ing real inboxes.
-  // "routes": [
-  //   { "pattern": "freeply.example.com", "custom_domain": true },
-  //   { "pattern": "workspace.example.com", "custom_domain": true },
-  // ],
+  // The cash.builds workspace answers here too, so opening it never shows a
+  // Freeply-branded URL. Same worker, same session — only the hostname differs.
+  // freeply.cannappy.org stays attached because tracked links already sent carry
+  // it — public_host was that hostname until the workspace rename, so every DM
+  // delivered in between points here. Dropping it 404s links in real inboxes.
+  // cashbuilds.cannappy.org was REMOVED here 2026-08-12. It now belongs to the
+  // `cashbuilds` worker (~/Desktop/Projects/cash-builds/worker), which serves the
+  // workspace and proxies everything it does not own back to this worker.
+  //
+  // Leaving it listed is not harmless. Both workers claimed it, so whichever
+  // deployed last silently owned it — and a routine `npm run deploy` here at
+  // 14:37 took the hostname back from a cutover finished at 14:28, reverting the
+  // workspace to these older handlers with no error on either side. That is the
+  // coupling the split exists to remove, so the claim has to go, not just lose.
+  //
+  // Freeply keeps freeply.cannappy.org: tracked links already sitting in real DMs
+  // carry it, and public_host is still set to it.
+  "routes": [
+    { "pattern": "freeply.cannappy.org", "custom_domain": true },
+  ],
 
   "triggers": {
     "crons": [

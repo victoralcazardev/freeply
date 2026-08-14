@@ -100,8 +100,11 @@ describe("staleRecentMediaStats", () => {
     await db.savePostStats(env.DB, "aging", stats());
 
     expect(await db.staleRecentMediaStats(env.DB, 10)).toEqual([]);
+    // 0, not a negative — 0 is what every caller passes for "ignore the cache"
+    // (both refresh paths, the MCP tool), so it is the value the special case
+    // has to hold for. A negative exercised a branch nothing reaches.
     expect(
-      (await db.staleRecentMediaStats(env.DB, 10, -1)).map((s) => s.mediaId),
+      (await db.staleRecentMediaStats(env.DB, 10, 0)).map((s) => s.mediaId),
     ).toEqual(["aging"]);
   });
 });

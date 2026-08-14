@@ -9,6 +9,7 @@ import {
 import { scheduled } from "./cron";
 import { MANUAL_MEDIA, type Tab, dashboardPage, loginPage } from "./dashboard";
 import * as db from "./db";
+import { handleChannel } from "./channel";
 import { canEscape, escapePage, isInAppBrowser } from "./escape";
 import { filesIndex, serveFile } from "./files";
 import { ICON_SVG, appleIconBytes } from "./icon";
@@ -56,6 +57,14 @@ export interface Env {
    * rather than a broken deploy.
    */
   MEDIA?: R2Bucket;
+
+  /**
+   * Gates the /channel endpoints the Kuff app uses (see src/channel.ts).
+   * Its own secret, deliberately: this one ships inside an app binary and must
+   * be assumed extractable, so it can never be the dashboard password and never
+   * MCP_STATS_TOKEN. Unset = the routes 404.
+   */
+  CHANNEL_TOKEN?: string;
 }
 
 export { AccountDO } from "./account-do";
@@ -92,6 +101,11 @@ export default {
     // Token-authed, never by session — the caller is a claude.ai connector,
     // not a browser. Auth and 404-when-off live inside the handler.
     if (path === "/mcp" || path.startsWith("/mcp/")) return handleMcp(request, path, env);
+
+    // Before the session-cookie gate: the app carries a bearer token, not a
+    // login, and routing it through the dashboard's auth would bounce it to a
+    // password form it has no way to answer.
+    if (path.startsWith("/channel/")) return handleChannel(request, path, env);
 
     // OAuth discovery probes, answered with a clean 404 so a client concludes
     // there is no authorization server to negotiate with and just calls /mcp
@@ -307,7 +321,7 @@ export default {
         requested === "campaigns" || requested === "links" || requested === "settings"
           ? requested
           : "overview";
-      return renderDashboard(env, url.host, tab, url.searchParams.get("edit"), {
+      return renderDashboard(env, ctx, url.host, tab, url.searchParams.get("edit"), {
         status: url.searchParams.get("status") ?? undefined,
         error: url.searchParams.get("error") ?? undefined,
       });
@@ -508,7 +522,7 @@ export default {
 
       const accountDelete = path.match(/^\/accounts\/([^/]+)\/delete$/);
       if (accountDelete) {
-        await db.deleteAccount(env.DB, accountDelete[1]);
+        await db.disconnectAccount(env.DB, accountDelete[1]);
         return redirect("/?tab=settings");
       }
 
@@ -530,8 +544,27 @@ export default {
 const redirect = (to: string) => new Response(null, { status: 302, headers: { location: to } });
 const redirectHome = () => redirect("/");
 
+/**
+ * The dashboard renders from D1 and refreshes from Instagram afterwards.
+ *
+ * It used to await both refreshes before emitting a byte, which put every
+ * stale-cache load behind a round trip to Meta — and a *refused* token behind a
+ * failing one, which is slower than a working one and was the difference
+ * between a snappy dashboard and one that felt broken. Nothing on this page is
+ * worth blocking a render for: the numbers are already a cache with a
+ * 15-minute TTL, and the cron sweeps them hourly regardless.
+ *
+ * So the visitor gets last cycle's numbers immediately and this cycle's land in
+ * D1 before they reload. `waitUntil` keeps the isolate alive for that work
+ * after the response is sent — the one thing it must not do is throw, or the
+ * runtime logs an unhandled rejection for a page that already succeeded.
+ *
+ * `POST /refresh` stays synchronous on purpose. That one is a button someone
+ * pressed, and the whole point of pressing it is to wait.
+ */
 async function renderDashboard(
   env: Env,
+  ctx: ExecutionContext,
   host: string,
   tab: Tab,
   editId: string | null,
@@ -547,41 +580,91 @@ async function renderDashboard(
   ]);
 
   // Only the overview renders post metrics, and only the campaign form offers
-  // the post picker, so each tab pays for its own refresh and no other.
-  const fresh = tab === "overview" ? await refreshPostStats(env, posts) : posts;
-  if (tab === "overview") await refreshRecentMediaStats(env);
-  const media = tab === "campaigns" ? await pickableMedia(env, accounts) : [];
+  // the post picker, so each tab queues its own refresh and no other.
+  if (tab === "overview") {
+    ctx.waitUntil(
+      inBackground("post stats", async () => {
+        await refreshPostStats(env, posts);
+        await refreshRecentMediaStats(env);
+      }),
+    );
+  }
+
+  // The picker is the one place a stale cache is actually felt — you cannot
+  // attach a campaign to a post that isn't listed. An account with *nothing*
+  // cached therefore still pays for one inline list call; that is a first-run
+  // cost paid once, not on every visit. Merely stale refreshes behind the
+  // render, and the form's manual media-id field covers the post published
+  // thirty seconds ago either way.
+  const media = tab === "campaigns" ? await pickableMedia(env, accounts, ctx) : [];
   const editing = editId ? (campaigns.find((c) => c.id === editId) ?? null) : null;
   return dashboardPage({
-    accounts, campaigns, links, sends, stats, posts: fresh, media, host, tab, editing, filter,
+    accounts, campaigns, links, sends, stats, posts, media, host, tab, editing, filter,
   });
+}
+
+/**
+ * Runs background work that must never reject.
+ *
+ * A throw inside `waitUntil` is an unhandled rejection against a request that
+ * already returned 200, so it surfaces in the logs as a failure of a page that
+ * worked. Swallowed here with a label instead, because the caller has nowhere
+ * to put an error by the time this runs.
+ */
+async function inBackground(label: string, work: () => Promise<void>): Promise<void> {
+  try {
+    await work();
+  } catch (cause) {
+    console.error(`background refresh (${label}) failed:`, cause);
+  }
 }
 
 /** Enough posts to cover a month of regular posting without a long scroll. */
 const MEDIA_PICKER_LIMIT = 24;
 
 /**
- * Recent posts for the campaign form, from cache, topped up when it has aged out.
+ * Recent posts for the campaign form, from cache, topped up behind the render.
  *
  * Same 15-minute TTL as post insights, and the same tolerance: an account whose
  * media can't be read keeps whatever was cached last, so a token that has lost
  * its permissions leaves the picker stale rather than empty. An account already
- * flagged for reconnection isn't asked at all — its token is refused until a
- * human replaces it, and the form can be opened as often as you like.
+ * flagged for reconnection isn't asked at all, and neither is a disconnected
+ * one — the first has a token Meta refuses until a human replaces it, the
+ * second has one the operator has deliberately stopped using.
+ *
+ * Never-fetched is the one case that still blocks. An empty picker is not a
+ * stale picker — it is a form you cannot complete — so the first load after
+ * connecting an account waits for its list, and every load after that reads
+ * cache and refreshes afterwards.
  */
-async function pickableMedia(env: Env, accounts: db.Account[]): Promise<db.MediaItem[]> {
+async function pickableMedia(
+  env: Env,
+  accounts: db.Account[],
+  ctx: ExecutionContext,
+): Promise<db.MediaItem[]> {
   const lists = await Promise.all(
     accounts.map(async (account) => {
-      const stale = db.cacheIsStale(await db.mediaCheckedAt(env.DB, account.igUserId));
-      if (stale && !account.needsReconnect) {
-        const token = await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, account.igUserId);
-        const media = token ? await getRecentMedia(token, MEDIA_PICKER_LIMIT) : null;
-        if (media) await db.saveAccountMedia(env.DB, account.igUserId, media);
+      const checkedAt = await db.mediaCheckedAt(env.DB, account.igUserId);
+      const usable = !account.needsReconnect && account.disconnectedAt === null;
+      if (db.cacheIsStale(checkedAt) && usable) {
+        const load = () => refreshAccountMedia(env, account.igUserId);
+        if (checkedAt === null) {
+          await load();
+        } else {
+          ctx.waitUntil(inBackground(`media picker ${account.igUserId}`, load));
+        }
       }
       return db.listAccountMedia(env.DB, account.igUserId, MEDIA_PICKER_LIMIT);
     }),
   );
   return lists.flat();
+}
+
+/** One account's recent media, refetched and cached. */
+async function refreshAccountMedia(env: Env, igUserId: string): Promise<void> {
+  const token = await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, igUserId);
+  const media = token ? await getRecentMedia(token, MEDIA_PICKER_LIMIT) : null;
+  if (media) await db.saveAccountMedia(env.DB, igUserId, media);
 }
 
 /**
@@ -596,25 +679,36 @@ async function refreshPostStats(
   const stale = posts.filter((p) => db.cacheIsStale(p.fetchedAt));
   if (stale.length === 0) return posts;
 
+  // Same two fixes as refreshRecentMediaStats below, same reasons: tokens
+  // resolved once up front (the fire-everything shape raced the map), and the
+  // fan-out bounded so resolved responses get read before the runtime starts
+  // cancelling the oldest unread one — this loop was the other uncapped sweep
+  // feeding the stall-canceller.
   const tokens = new Map<string, string | null>();
-  const updated = await Promise.all(
-    stale.map(async (post) => {
-      if (!tokens.has(post.igUserId)) {
-        tokens.set(
-          post.igUserId,
-          await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, post.igUserId),
-        );
-      }
-      const token = tokens.get(post.igUserId);
-      if (!token) return null;
+  for (const post of stale) {
+    if (!tokens.has(post.igUserId)) {
+      tokens.set(post.igUserId, await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, post.igUserId));
+    }
+  }
 
-      const s = await getMediaStats(post.mediaId, token);
-      if (!s) return null;
+  const updated: Array<(db.PostPerformance & { fetchedAt: number }) | null> = [];
+  const WIDTH = 3;
+  for (let i = 0; i < stale.length; i += WIDTH) {
+    updated.push(
+      ...(await Promise.all(
+        stale.slice(i, i + WIDTH).map(async (post) => {
+          const token = tokens.get(post.igUserId);
+          if (!token) return null;
 
-      await db.savePostStats(env.DB, post.mediaId, s);
-      return { ...post, ...s, fetchedAt: Date.now() };
-    }),
-  );
+          const s = await getMediaStats(post.mediaId, token);
+          if (!s) return null;
+
+          await db.savePostStats(env.DB, post.mediaId, s);
+          return { ...post, ...s, fetchedAt: Date.now() };
+        }),
+      )),
+    );
+  }
 
   const byId = new Map(updated.filter(Boolean).map((p) => [p!.mediaId, p!]));
   return posts.map((p) => byId.get(p.mediaId) ?? p);
@@ -641,9 +735,18 @@ export async function refreshStaleAccountMedia(env: Env, maxAgeMs: number): Prom
   const accounts = await db.listAccounts(env.DB);
 
   for (const account of accounts) {
-    if (account.needsReconnect) continue;
+    // Disconnected is as good a reason to skip as flagged: listAccounts returns
+    // every row, disconnecting keeps the row (migration 0014), and its stored
+    // token is one the operator has deliberately stopped using.
+    if (account.needsReconnect || account.disconnectedAt !== null) continue;
+    // maxAgeMs of 0 means "no cache is fresh enough" — the manual refresh — and
+    // that cannot be a boundary comparison. A stamp written in the same
+    // millisecond ties with the cutoff and reads as fresh, so `Refresh now`
+    // silently swept nothing whenever it landed inside the writing tick. Rare
+    // in a browser, constant under test, and always a lie.
+    const skipFresh = maxAgeMs > 0;
     const checked = await db.mediaCheckedAt(env.DB, account.igUserId);
-    if (checked !== null && checked >= cutoff) continue;
+    if (skipFresh && checked !== null && checked >= cutoff) continue;
 
     const token = await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, account.igUserId);
     if (!token) continue;
@@ -657,22 +760,35 @@ export async function refreshRecentMediaStats(env: Env, maxAgeMs?: number): Prom
   const stale = await db.staleRecentMediaStats(env.DB, MEDIA_STATS_LIMIT, maxAgeMs);
   if (stale.length === 0) return;
 
+  // Tokens first, sequentially — the old fire-everything shape also raced this
+  // map (has() then an awaited set), fetching the same token once per post.
   const tokens = new Map<string, string | null>();
-  await Promise.all(
-    stale.map(async (m) => {
-      if (!tokens.has(m.igUserId)) {
-        tokens.set(
-          m.igUserId,
-          await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, m.igUserId),
-        );
-      }
-      const token = tokens.get(m.igUserId);
-      if (!token) return;
+  for (const m of stale) {
+    if (!tokens.has(m.igUserId)) {
+      tokens.set(m.igUserId, await db.getAccountToken(env.DB, env.ENCRYPTION_KEY, m.igUserId));
+    }
+  }
 
-      const s = await getMediaStats(m.mediaId, token);
-      if (s) await db.savePostStats(env.DB, m.mediaId, s);
-    }),
-  );
+  // Bounded concurrency, and this bound is load-bearing — it is not a politeness
+  // knob. Each post fans out into several Graph calls, and an isolate holds only
+  // a handful of connections; Promise.all over every post parked resolved
+  // responses unread while other posts' code ran, and the runtime "prevents
+  // deadlock" by cancelling the OLDEST unread response. Those cancellations were
+  // the sweep's phantom nulls: a cancelled media-fields call left product type
+  // null, which skipped the reel-metrics request entirely, which is why
+  // skip/watch flapped between sweeps on unchanged posts. Three posts at a time
+  // keeps ~6 requests in flight — inside the budget, so nothing gets cancelled.
+  const WIDTH = 3;
+  for (let i = 0; i < stale.length; i += WIDTH) {
+    await Promise.all(
+      stale.slice(i, i + WIDTH).map(async (m) => {
+        const token = tokens.get(m.igUserId);
+        if (!token) return;
+        const s = await getMediaStats(m.mediaId, token);
+        if (s) await db.savePostStats(env.DB, m.mediaId, s);
+      }),
+    );
+  }
 }
 
 /* -------------------------------------------------------------------- oauth */
@@ -771,7 +887,19 @@ async function receiveEvent(
   const comments = extractComments(payload);
   const storyReplies = extractStoryReplies(payload);
   const postbacks = extractPostbacks(payload);
-  if (comments.length === 0 && storyReplies.length === 0 && postbacks.length === 0) {
+
+  // Storing is not answering: this keeps the operator's own DMs and sends
+  // nothing, so it runs beside the handlers rather than through the outbox.
+  // Reads a setting, so it can't join the synchronous extraction above.
+  ctx.waitUntil(inBackground("store self DMs", () => storeSelfDMs(payload, env)));
+
+  const carriedMessages = (payload.entry ?? []).some((e) => (e.messaging ?? []).length > 0);
+  if (
+    comments.length === 0 &&
+    storyReplies.length === 0 &&
+    postbacks.length === 0 &&
+    !carriedMessages
+  ) {
     // A delivery we can't read is the one failure that looked exactly like
     // success: 200 back to Meta, nothing logged, nothing sent. Print what did
     // arrive so the field name it came under is visible.
@@ -798,6 +926,41 @@ async function receiveEvent(
     ctx.waitUntil(handlePostback(tap, env, host));
   }
   return new Response("ok");
+}
+
+/**
+ * Keeps DMs the operator sent between their own accounts. Writes to `dm_inbox`
+ * and touches nothing else — no campaign matching, no dedupe claim, no send.
+ *
+ * Every delivery is a chance to capture something Instagram will not hand back
+ * later: the conversations API only reaches the last 20 messages in a thread, so
+ * a message missed here is unrecoverable rather than merely late.
+ */
+export async function storeSelfDMs(payload: InstagramWebhookPayload, env: Env): Promise<void> {
+  const selfIds = new Set(await db.selfAccountIds(env.DB));
+  const ideas = extractSelfDMs(payload, selfIds);
+
+  for (const idea of ideas) {
+    const stored = await db.recordDMIdea(env.DB, {
+      mid: idea.messageId,
+      igUserId: idea.igUserId,
+      senderId: idea.senderId,
+      recipientId: idea.recipientId,
+      isEcho: idea.isEcho,
+      text: idea.text,
+      attachmentType: idea.attachmentType,
+      sharedUrl: idea.sharedUrl,
+      sharedMediaId: idea.sharedMediaId,
+      rawJson: idea.raw,
+      receivedAt: Date.now(),
+    });
+    // The attachment type is the open question this feature shipped with — log
+    // it so the first real reel share reveals its shape without a debug deploy.
+    console.log(
+      `self DM ${stored ? "stored" : "already had"} ${idea.messageId} ` +
+        `echo=${idea.isEcho} attachment=${idea.attachmentType ?? "none"}`,
+    );
+  }
 }
 
 /**
@@ -1156,6 +1319,70 @@ export function extractStoryReplies(payload: InstagramWebhookPayload): StoryRepl
   return events;
 }
 
+/** One DM between the operator's own accounts, on its way to `dm_inbox`. */
+export interface SelfDMEvent {
+  igUserId: string;
+  messageId: string;
+  senderId: string;
+  recipientId: string | null;
+  isEcho: boolean;
+  text: string;
+  attachmentType: string | null;
+  sharedUrl: string | null;
+  sharedMediaId: string | null;
+  /** The whole messaging event, verbatim. See migration 0017 for why. */
+  raw: string;
+}
+
+/**
+ * DMs the operator sent between their own accounts — where the reel ideas live.
+ *
+ * Echoes are KEPT here, which is the opposite of every other handler in this
+ * file and the only reason the feature works in both directions. Just one of the
+ * two accounts is connected to this worker, so:
+ *
+ *   other → connected   arrives as an ordinary inbound message
+ *   connected → other   arrives ONLY as an echo of our own send
+ *
+ * Skipping echoes the way the story-reply and comment paths do would silently
+ * drop every idea sent in the second direction. The filter is instead on the
+ * OTHER party: whoever isn't us on this delivery has to be one of our own ids,
+ * so a stranger's DM is never stored, in either direction.
+ */
+export function extractSelfDMs(
+  payload: InstagramWebhookPayload,
+  selfIds: Set<string>,
+): SelfDMEvent[] {
+  const events: SelfDMEvent[] = [];
+  if (selfIds.size === 0) return events;
+
+  for (const entry of payload.entry ?? []) {
+    for (const m of entry.messaging ?? []) {
+      if (!m.message?.mid || !m.sender?.id) continue;
+
+      const isEcho = Boolean(m.is_echo || m.message.is_echo);
+      // On an echo we are the sender, so the counterparty is the recipient.
+      const counterparty = isEcho ? m.recipient?.id : m.sender.id;
+      if (!counterparty || !selfIds.has(counterparty)) continue;
+
+      const attachment = m.message.attachments?.[0];
+      events.push({
+        igUserId: entry.id,
+        messageId: m.message.mid,
+        senderId: m.sender.id,
+        recipientId: m.recipient?.id ?? null,
+        isEcho,
+        text: m.message.text ?? "",
+        attachmentType: attachment?.type ?? null,
+        sharedUrl: attachment?.payload?.url ?? null,
+        sharedMediaId: attachment?.payload?.reel_video_id ?? attachment?.payload?.id ?? null,
+        raw: JSON.stringify(m),
+      });
+    }
+  }
+  return events;
+}
+
 export interface PostbackEvent {
   igUserId: string;
   /** Meta's id for the tap. Unique, and the outbox needs one. */
@@ -1292,6 +1519,21 @@ interface InstagramWebhookPayload {
         text?: string;
         is_echo?: boolean;
         reply_to?: { story?: { id?: string; url?: string } };
+        /**
+         * Everything optional and nothing trusted. Meta documents only that "the
+         * image or video URL for a share will be included" and names no field, so
+         * these are the plausible keys rather than confirmed ones — which is why
+         * the whole event is stored verbatim alongside whatever this parse finds.
+         */
+        attachments?: Array<{
+          type?: string;
+          payload?: {
+            url?: string;
+            title?: string;
+            reel_video_id?: string;
+            id?: string;
+          };
+        }>;
       };
     }>;
     changes?: Array<{

@@ -137,8 +137,12 @@ export async function serveFile(request: Request, env: Env, key: string): Promis
   if (!headers.has("content-type")) headers.set("content-type", contentType(key));
   headers.set("etag", obj.httpEtag);
   headers.set("accept-ranges", "bytes");
-  // Private: it is behind the session, so no shared cache may keep a copy.
-  headers.set("cache-control", "private, max-age=3600");
+  // no-store, same as every other session-gated response here. `private,
+  // max-age=3600` let the browser keep a playable copy for an hour, and a stored
+  // response is replayed without the cookie being looked at — so signing out on
+  // a shared phone left the reels reachable from the back button. The etag path
+  // below still saves the bytes on a repeat view within the same session.
+  headers.set("cache-control", "no-store");
 
   // onlyIf failed the precondition, so R2 returned metadata with no body.
   if (!("body" in obj)) return new Response(null, { status: 304, headers });

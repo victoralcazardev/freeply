@@ -12,7 +12,8 @@
   "scripts": {
     "dev": "wrangler d1 migrations apply freeply --local && wrangler dev",
     "build:workspace": "node scripts/build-workspace.mjs",
-    "deploy": "npm run build:workspace && wrangler deploy",
+    "predeploy": "node scripts/check-routes.mjs",
+    "deploy": "npm run predeploy && npm run build:workspace && wrangler deploy",
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

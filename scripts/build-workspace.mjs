@@ -9,14 +9,38 @@
  * Run `npm run build:workspace` after editing the source page.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SOURCE = process.env.WORKSPACE_HTML_SRC
-  ?? join(root, "..", "cash-builds", "dashboard.html");
+/**
+ * The source page lives in the cash-builds repo, not this one — it is one
+ * operator's private workspace and has no business in a project other people
+ * clone. So `src/workspace-html.ts` is checked in as the artifact, and this
+ * script only runs for whoever has the source beside it.
+ *
+ * The default is a sibling checkout, which is where it sits on that machine.
+ * Anywhere else that path doesn't exist, and until 2026-08-14 the failure was a
+ * bare ENOENT naming a directory the clone never had — during `npm run deploy`,
+ * which runs this before wrangler. Validate it here instead, and say what to do.
+ */
+const DEFAULT_SOURCE = join(root, "..", "cash-builds", "dashboard.html");
+const SOURCE = process.env.WORKSPACE_HTML_SRC ?? DEFAULT_SOURCE;
 const OUT = join(root, "src", "workspace-html.ts");
+
+if (!existsSync(SOURCE)) {
+  console.error(
+    `build:workspace: no workspace page at ${SOURCE}\n` +
+      (process.env.WORKSPACE_HTML_SRC
+        ? "  WORKSPACE_HTML_SRC points at a file that isn't there.\n"
+        : "  That is the default — a cash-builds checkout beside this repo.\n" +
+          "  Set WORKSPACE_HTML_SRC=/path/to/dashboard.html if yours is elsewhere.\n") +
+      `  Nothing was written. ${relative(root, OUT)} is checked in, so a clone\n` +
+      "  without the source can deploy the page it already has: skip this step.",
+  );
+  process.exit(1);
+}
 
 const html = readFileSync(SOURCE, "utf8");
 
