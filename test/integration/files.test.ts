@@ -59,6 +59,31 @@ describe("the session gate", () => {
   });
 });
 
+/**
+ * Reels served before /files switched to no-store went out with
+ * `private, max-age=3600`, and a stored response is replayed without the cookie
+ * being consulted — so clearing the session cookie does nothing to them and they
+ * stay reachable from the back button for the rest of that hour. Clearing the
+ * cache at sign-out is what evicts them.
+ */
+describe("signing out", () => {
+  it("tells the browser to drop what it cached for this origin", async () => {
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request("https://freeply.test/logout", { method: "POST" }),
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("clear-site-data")).toBe('"cache"');
+    // Not "storage": the workspace page keeps its board seed and chat history in
+    // localStorage, and signing out is not a request to delete those.
+    expect(res.headers.get("clear-site-data")).not.toContain("storage");
+  });
+});
+
 describe("GET /files/<key> ranges", () => {
   it("answers iOS's opening probe with 206 and a correct Content-Range", async () => {
     const res = await get(`/files/${KEY}`, { range: "bytes=0-1" });

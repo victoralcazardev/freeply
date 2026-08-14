@@ -140,8 +140,17 @@ export async function serveFile(request: Request, env: Env, key: string): Promis
   // no-store, same as every other session-gated response here. `private,
   // max-age=3600` let the browser keep a playable copy for an hour, and a stored
   // response is replayed without the cookie being looked at — so signing out on
-  // a shared phone left the reels reachable from the back button. The etag path
-  // below still saves the bytes on a repeat view within the same session.
+  // a shared phone left the reels reachable from the back button.
+  //
+  // The trade is paid in full, and it is worth being exact about: no-store means
+  // the browser stores nothing, so there is nothing to revalidate and every view
+  // — every scrub backwards — is fetched again. The 304 branch below is not a
+  // saving on top of that. It answers whatever client does send If-None-Match,
+  // and a browser holding this header is not one: it has nothing to ask about.
+  //
+  // This header only governs responses sent from here on. Copies stored under
+  // the old `max-age=3600` are evicted by the Clear-Site-Data on /logout — see
+  // the logout route in index.ts, which is the half of this that reaches back.
   headers.set("cache-control", "no-store");
 
   // onlyIf failed the precondition, so R2 returned metadata with no body.

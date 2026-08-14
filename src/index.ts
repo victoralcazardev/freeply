@@ -213,7 +213,22 @@ export default {
     if (path === "/logout") {
       return new Response(null, {
         status: 302,
-        headers: { location: "/login", "set-cookie": clearCookie },
+        headers: {
+          location: "/login",
+          "set-cookie": clearCookie,
+          // Drops what the browser already stored for this origin. Reels served
+          // before /files switched to no-store were sent `private, max-age=3600`
+          // and stay replayable from the back button for the rest of that hour —
+          // clearing the cookie does nothing to them, because a stored response
+          // is reused without the cookie being consulted. WebKit makes this
+          // directive evict the back/forward cache specifically, which is the
+          // shared-phone case worth caring about.
+          //
+          // "cache" alone, deliberately. "storage" would also wipe localStorage,
+          // and the workspace page keeps its board seed and chat history there —
+          // signing out is not a request to delete those.
+          "clear-site-data": '"cache"',
+        },
       });
     }
 

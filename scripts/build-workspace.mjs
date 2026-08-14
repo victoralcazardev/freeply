@@ -9,7 +9,7 @@
  * Run `npm run build:workspace` after editing the source page.
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,20 +29,42 @@ const DEFAULT_SOURCE = join(root, "..", "cash-builds", "dashboard.html");
 const SOURCE = process.env.WORKSPACE_HTML_SRC ?? DEFAULT_SOURCE;
 const OUT = join(root, "src", "workspace-html.ts");
 
-if (!existsSync(SOURCE)) {
+/**
+ * Every way the read can fail comes here, because from the caller's side they
+ * are one problem: no page was baked, mid-`npm run deploy`.
+ *
+ * Checking `existsSync` first and reading after was worse than not checking. It
+ * answers true for a DIRECTORY, so a WORKSPACE_HTML_SRC pointing at the folder
+ * rather than the file sailed past the guard and threw EISDIR from readFileSync
+ * as a bare stack trace — the exact failure the guard was added to replace. An
+ * unreadable file did the same with EACCES, and the gap between the two calls
+ * was a race besides. One read, one catch, one message.
+ */
+function explain(cause) {
+  const missing = cause.code === "ENOENT";
   console.error(
-    `build:workspace: no workspace page at ${SOURCE}\n` +
-      (process.env.WORKSPACE_HTML_SRC
-        ? "  WORKSPACE_HTML_SRC points at a file that isn't there.\n"
-        : "  That is the default — a cash-builds checkout beside this repo.\n" +
-          "  Set WORKSPACE_HTML_SRC=/path/to/dashboard.html if yours is elsewhere.\n") +
+    `build:workspace: could not read the workspace page at ${SOURCE}\n` +
+      // Node prefixes fs messages with the code already, so no code here.
+      `  ${cause.message}\n` +
+      (missing
+        ? process.env.WORKSPACE_HTML_SRC
+          ? "  WORKSPACE_HTML_SRC points at a file that isn't there.\n"
+          : "  That is the default — a cash-builds checkout beside this repo.\n" +
+            "  Set WORKSPACE_HTML_SRC=/path/to/dashboard.html if yours is elsewhere.\n"
+        : "  The path resolves but does not read as a file. Check it names\n" +
+          "  dashboard.html itself rather than its directory, and is readable.\n") +
       `  Nothing was written. ${relative(root, OUT)} is checked in, so a clone\n` +
       "  without the source can deploy the page it already has: skip this step.",
   );
-  process.exit(1);
 }
 
-const html = readFileSync(SOURCE, "utf8");
+let html;
+try {
+  html = readFileSync(SOURCE, "utf8");
+} catch (cause) {
+  explain(cause);
+  process.exit(1);
+}
 
 writeFileSync(
   OUT,
