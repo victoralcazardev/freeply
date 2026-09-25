@@ -34,7 +34,7 @@ if (claimed) {
   console.error(
     `\nRefusing to deploy: wrangler.jsonc claims ${FORBIDDEN} in its routes.\n\n` +
       `That hostname belongs to the cashbuilds worker\n` +
-      `(~/Desktop/Projects/cash-builds/worker). Deploying with it listed takes the\n` +
+      `(~/Desktop/Projects/content/cash-builds/ops/worker). Deploying with it listed takes the\n` +
       `workspace back from that worker silently — no error, no warning, the dashboard\n` +
       `just reverts to Freeply's handlers.\n\n` +
       `Remove it from the routes array and deploy again. Freeply keeps\n` +
