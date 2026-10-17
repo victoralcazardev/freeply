@@ -476,9 +476,10 @@ as proven. In particular:
 - **Token refresh has never actually renewed a token.** Until you deploy and a cron runs,
   an account still stops working ~60 days after you connect it. The dashboard shows the
   countdown either way.
-- **Reconciliation has never recovered a real dropped webhook.** The polling, the 7-day
-  cutoff and the dedupe on replay are all there and tested; the case they exist for has
-  only ever been simulated.
+- **Reconciliation is proven live.** It has recovered real comments since July 2026, and
+  from 14 to 16 October 2026 it sent all 20 DMs of one giveaway, because that account got
+  no comment webhooks from the public. It was connected without an Instagram Tester role,
+  the likely cause (not yet proven); its own sends and replies still arrived as webhooks.
 - **No retry has run against a real Graph API failure.** The backoff and the permanent-vs-
   transient split are written against Meta's documented error codes.
 - **The post picker calls `GET /me/media`, which hasn't been exercised live either.** If it

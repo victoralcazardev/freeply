@@ -70,7 +70,14 @@
       "7 4 * * *",
       // Missed-webhook reconciliation. A dropped delivery is a lead that expires
       // when the 7-day private-reply window closes, not one that waits.
-      "*/15 * * * *"
+      "*/15 * * * *",
+      // The same reconciliation every two minutes. An account connected without an
+      // Instagram Tester role got no comment webhooks from the public (the role is
+      // the likely cause, not proven), so this poll was its only route to a DM, and
+      // 15 minutes was too slow for a giveaway: all 20 of its sends from 14 to 16
+      // Oct 2026 came this way. A pinned post costs one Graph call a run, about 30
+      // an hour against Instagram's ~200.
+      "*/2 * * * *"
     ]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountDO"] }],
