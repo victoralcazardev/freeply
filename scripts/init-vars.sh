@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Creates .dev.vars and fills in the three values a machine can generate:
-# META_VERIFY_TOKEN, ENCRYPTION_KEY, DASHBOARD_PASSWORD.
+# Creates .dev.vars and fills in the four values a machine can generate:
+# META_VERIFY_TOKEN, ENCRYPTION_KEY, DASHBOARD_PASSWORD, API_TOKEN.
 #
 #   npm run init
 #
@@ -68,7 +68,7 @@ set_var() {
 
 # name:bytes — 24 bytes of hex is 48 chars, which is plenty for a verify token,
 # and ENCRYPTION_KEY must be 32 bytes because that's what AES-GCM takes.
-GENERATED=(META_VERIFY_TOKEN:24 ENCRYPTION_KEY:32 DASHBOARD_PASSWORD:12)
+GENERATED=(META_VERIFY_TOKEN:24 ENCRYPTION_KEY:32 DASHBOARD_PASSWORD:12 API_TOKEN:24)
 
 echo
 for entry in "${GENERATED[@]}"; do

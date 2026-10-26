@@ -6,6 +6,8 @@ import {
   isValidSession,
   sessionCookie,
 } from "./auth";
+import { handleApi } from "./api";
+import { type CampaignFields, saveCampaignWithLink } from "./campaign-save";
 import { scheduled } from "./cron";
 import { MANUAL_MEDIA, type Tab, dashboardPage, loginPage } from "./dashboard";
 import * as db from "./db";
@@ -37,6 +39,9 @@ export interface Env {
   META_VERIFY_TOKEN: string;
 
   OPERATOR_EMAIL: string;
+
+  /** Bearer token for the /api/* JSON endpoints. Unset turns them off (404). */
+  API_TOKEN?: string;
 }
 
 export { AccountDO } from "./account-do";
@@ -52,6 +57,9 @@ export default {
       if (request.method === "POST") return receiveEvent(request, env, ctx);
       return new Response("method not allowed", { status: 405 });
     }
+
+    // Bearer-token JSON API; no session, no cookies.
+    if (path === "/api" || path.startsWith("/api/")) return handleApi(request, env, url);
 
     // The example address counts as unset. `npm run setup` refuses to deploy while
     // OPERATOR_EMAIL is still the placeholder, but a bare `wrangler deploy` doesn't,
@@ -153,35 +161,27 @@ export default {
         return (picked === MANUAL_MEDIA ? s("media_id_manual") : picked) || null;
       };
 
+      // Fields both campaign routes read from the form. Matching defaults to
+      // "contains" and scope to "per_post" for anything unrecognised.
+      const campaignFields = (): CampaignFields => ({
+        igUserId: s("ig_user_id"),
+        name: s("name"),
+        mediaId: pickedMediaId(),
+        keywords: db.splitKeywords(s("keywords")),
+        matchMode: s("match_mode") === "whole_word" ? "whole_word" : "contains",
+        dedupeScope: s("dedupe_scope") === "campaign" ? "campaign" : "per_post",
+        storyReplies: s("story_replies") === "1",
+        iceBreaker: s("ice_breaker") || null,
+        dmMessage: s("dm_message"),
+        publicReply: s("public_reply") || null,
+      });
+
       if (path === "/campaigns") {
         // Creating the link is part of creating the campaign — asking someone to
         // make one separately and wire it up by hand is a step with no purpose.
-        let linkId: string | null = null;
-        const targetUrl = db.normalizeUrl(s("link_url"));
-        if (targetUrl) {
-          linkId = db.newId();
-          await db.saveLink(env.DB, {
-            id: linkId,
-            code: db.newLinkCode(),
-            targetUrl,
-            tracked: s("track_link") !== "no",
-          });
-        }
-
-        await db.saveCampaign(env.DB, {
-          id: db.newId(),
-          igUserId: s("ig_user_id"),
-          name: s("name"),
-          mediaId: pickedMediaId(),
-          keywords: db.splitKeywords(s("keywords")),
-          matchMode: s("match_mode") === "whole_word" ? "whole_word" : "contains",
-          dedupeScope: s("dedupe_scope") === "campaign" ? "campaign" : "per_post",
-          storyReplies: s("story_replies") === "1",
-          iceBreaker: s("ice_breaker") || null,
-          dmMessage: s("dm_message"),
-          publicReply: s("public_reply") || null,
-          linkId,
-          active: true,
+        await saveCampaignWithLink(env.DB, null, campaignFields(), {
+          targetUrl: db.normalizeUrl(s("link_url")),
+          tracked: s("track_link") !== "no",
         });
         return redirect("/?tab=campaigns");
       }
@@ -192,47 +192,11 @@ export default {
         if (!existing) return redirect("/?tab=campaigns");
 
         // Blank link field keeps the current link; a new URL replaces it; the
-        // checkbox detaches it. Replaced links stay in the table with their
-        // click history rather than vanishing.
-        let linkId = existing.linkId;
-        const targetUrl = db.normalizeUrl(s("link_url"));
-        const tracked = s("track_link") !== "no";
-        const currentLink = existing.linkId ? await db.getLink(env.DB, existing.linkId) : null;
-
-        if (s("remove_link") === "1") {
-          linkId = null;
-        } else if (targetUrl && currentLink && targetUrl === currentLink.targetUrl) {
-          // Same destination. The form prefills the current URL, so a save that
-          // didn't touch the link arrives looking exactly like a replacement —
-          // minting a row for it every time is what left three short codes
-          // pointing at one page, each splitting the click count. Only the
-          // tracked choice can have moved, and that belongs on the row we have.
-          if (tracked !== currentLink.tracked) {
-            await db.saveLink(env.DB, { ...currentLink, tracked });
-          }
-        } else if (targetUrl) {
-          linkId = db.newId();
-          await db.saveLink(env.DB, {
-            id: linkId,
-            code: db.newLinkCode(),
-            targetUrl,
-            tracked,
-          });
-        }
-
-        await db.saveCampaign(env.DB, {
-          ...existing,
-          igUserId: s("ig_user_id"),
-          name: s("name"),
-          mediaId: pickedMediaId(),
-          keywords: db.splitKeywords(s("keywords")),
-          matchMode: s("match_mode") === "whole_word" ? "whole_word" : "contains",
-          dedupeScope: s("dedupe_scope") === "campaign" ? "campaign" : "per_post",
-          storyReplies: s("story_replies") === "1",
-          iceBreaker: s("ice_breaker") || null,
-          dmMessage: s("dm_message"),
-          publicReply: s("public_reply") || null,
-          linkId,
+        // checkbox detaches it.
+        await saveCampaignWithLink(env.DB, existing, campaignFields(), {
+          targetUrl: db.normalizeUrl(s("link_url")),
+          tracked: s("track_link") !== "no",
+          remove: s("remove_link") === "1",
         });
         return redirect("/?tab=campaigns");
       }

@@ -463,6 +463,50 @@ export async function getRecentMedia(
     }));
 }
 
+/** Like getRecentMedia, but follows `paging.next` until `limit` posts or no more. */
+export async function listMediaPaged(
+  accessToken: string,
+  limit: number,
+): Promise<MediaSummary[] | null> {
+  const url = new URL(`${GRAPH_HOST}/${API_VERSION}/me/media`);
+  url.searchParams.set("fields", "id,caption,media_type,media_url,thumbnail_url,permalink,timestamp");
+  url.searchParams.set("limit", String(Math.min(limit, PAGE_SIZE)));
+  url.searchParams.set("access_token", accessToken);
+
+  const raw = await collectPages<RawMedia>(url, limit);
+  if (!raw) return null;
+  return raw
+    .filter((m): m is RawMedia & { id: string } => !!m.id)
+    .map((m) => ({
+      mediaId: m.id,
+      caption: m.caption ?? null,
+      thumbnailUrl: m.thumbnail_url ?? m.media_url ?? null,
+      permalink: m.permalink ?? null,
+      mediaType: m.media_type ?? null,
+      postedAt: m.timestamp ? Date.parse(m.timestamp) || null : null,
+    }));
+}
+
+const PAGE_SIZE = 100;
+
+/**
+ * Reads pages of `data` following `paging.next` until `limit` items. Null when
+ * the first page fails; a later page failing returns what was read so far.
+ * `next` is only followed on Graph's own host, since it carries the access token.
+ */
+async function collectPages<T>(first: URL, limit: number): Promise<T[] | null> {
+  const items: T[] = [];
+  let url: URL | null = first;
+  while (url && items.length < limit) {
+    const body: { data?: T[]; paging?: { next?: string } } | null = await getJson(url);
+    if (!body) return url === first ? null : items;
+    items.push(...(body.data ?? []));
+    const next: URL | null = body.paging?.next ? new URL(body.paging.next) : null;
+    url = next && next.origin === GRAPH_HOST ? next : null;
+  }
+  return items.slice(0, limit);
+}
+
 interface RawMedia {
   id?: string;
   caption?: string;
@@ -512,6 +556,40 @@ export async function listRecentComments(
   if (!body) return [];
 
   return (body.data ?? [])
+    .filter((c): c is RawComment & { id: string } => !!c.id)
+    .map((c) => ({
+      id: c.id,
+      text: c.text ?? "",
+      timestamp: c.timestamp ? (Date.parse(c.timestamp) || null) : null,
+      commenterId: c.from?.id,
+      username: c.from?.username ?? c.username,
+    }));
+}
+
+/**
+ * Top-level comments on one post, newest first, following `paging.next` up to
+ * `limit`. Null when the read fails (e.g. the post isn't this account's).
+ * Separate from listRecentComments so the cron's single-page behaviour is untouched.
+ */
+export async function listCommentsPaged(
+  mediaId: string,
+  accessToken: string,
+  limit: number,
+): Promise<RecentComment[] | null> {
+  const first = (fields: string) => {
+    const url = new URL(`${GRAPH_HOST}/${API_VERSION}/${mediaId}/comments`);
+    url.searchParams.set("fields", fields);
+    url.searchParams.set("limit", String(Math.min(limit, PAGE_SIZE)));
+    url.searchParams.set("access_token", accessToken);
+    return url;
+  };
+
+  // Same fallback as listRecentComments: `from` may be refused for the token.
+  const raw =
+    (await collectPages<RawComment>(first("id,text,timestamp,username,from"), limit)) ??
+    (await collectPages<RawComment>(first("id,text,timestamp"), limit));
+  if (!raw) return null;
+  return raw
     .filter((c): c is RawComment & { id: string } => !!c.id)
     .map((c) => ({
       id: c.id,

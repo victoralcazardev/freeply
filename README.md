@@ -227,8 +227,8 @@ Instagram one. Grab them if you like; setup won't wait for them.
 npm run init
 ```
 
-Creates `.dev.vars` and generates the three values you shouldn't have to invent —
-`META_VERIFY_TOKEN`, `ENCRYPTION_KEY`, `DASHBOARD_PASSWORD` — writing them straight into
+Creates `.dev.vars` and generates the four values you shouldn't have to invent —
+`META_VERIFY_TOKEN`, `ENCRYPTION_KEY`, `DASHBOARD_PASSWORD`, `API_TOKEN` — writing them straight into
 the file. They're never printed, so nothing lands in your scrollback or an agent's
 transcript. Re-running it never overwrites a value that's already set, so it can't
 orphan tokens already encrypted under your current key.
@@ -343,6 +343,26 @@ are two different claims, and only the second one counts.
 
 ---
 
+## JSON API
+
+For tooling that manages campaigns without the dashboard. Set `API_TOKEN` (`npm run init`
+generates it; `npm run setup` uploads it). Unset or empty, every `/api/*` route answers 404.
+Send `Authorization: Bearer <API_TOKEN>`; a wrong or missing token gets 401. No cookies, no
+CORS. Responses are JSON; errors are `{"error": "...", "detail"?: "..."}`.
+
+| Route | Does |
+|---|---|
+| `GET /api/accounts` | Connected accounts and whether each needs reconnecting |
+| `GET /api/media?ig_user_id=&limit=` | Recent posts (limit 1–500, default 100), following Graph paging |
+| `GET /api/comments?ig_user_id=&media_id=&limit=` | Top-level comments (limit 1–5000, default 1000) |
+| `GET /api/campaigns` | All campaigns with per-campaign `stats` and link `clicks` |
+| `POST /api/campaigns` | Create (`name`, `ig_user_id`, `keywords`, `match_mode`, `dm_message` required; optional `media_id`, `dedupe_scope`, `public_reply`, `link_url`, `track_link`, `active`) |
+| `PATCH /api/campaigns/:id` | Update any of those; `"link_url": null` removes the link |
+| `DELETE /api/campaigns/:id` | Delete |
+
+Campaigns are saved through the same code as the dashboard form, including short-link
+minting. Invalid input is a 400 `invalid_field` naming the field.
+
 ## Things Meta doesn't tell you
 
 Every line here cost at least an hour to find.
@@ -395,7 +415,7 @@ Setup, before anything is running:
 |---|---|
 | `npm run setup` fails at the deploy, mentioning a subdomain | The Cloudflare account has no workers.dev subdomain. Register it at dash.cloudflare.com → Compute (Workers & Pages), then re-run |
 | Deploy fails with "more than one account" | Your login sees several Cloudflare accounts. Set `CLOUDFLARE_ACCOUNT_ID` in `.dev.vars` and re-run |
-| `npm run setup` says a value is "still the example value" | It's unedited in `.dev.vars`. `npm run init` fills the three generated ones; the Instagram pair and `OPERATOR_EMAIL` are yours |
+| `npm run setup` says a value is "still the example value" | It's unedited in `.dev.vars`. `npm run init` fills the four generated ones; the Instagram pair and `OPERATOR_EMAIL` are yours |
 | Connect an account → Instagram shows "Invalid redirect_uri" | `https://YOUR-HOSTNAME/auth/callback` isn't registered under Instagram → API setup with Instagram login → Business login settings. Step 4, item 5 |
 | Connect an account → "Invalid platform app" | Same panel: the app's Business login settings are incomplete |
 | `npm run dev` exits immediately | Node older than 22, or a non-function export added to `src/index.ts` — workerd refuses to mount one |

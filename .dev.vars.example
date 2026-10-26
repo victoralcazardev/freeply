@@ -31,6 +31,10 @@ OPERATOR_EMAIL="you@example.com"
 
 # ---- Optional ----
 
+# Bearer token for the /api/* JSON endpoints. Empty keeps them off (404).
+# `npm run init` generates one; or: openssl rand -hex 24
+API_TOKEN=""
+
 # Only needed if your login has access to more than one Cloudflare account, or if
 # CLOUDFLARE_ACCOUNT_ID isn't already in your environment. It's on the right-hand
 # side of the Cloudflare dashboard overview page.

@@ -945,3 +945,21 @@ export async function sendStats(
   stats.sent += stats.recovered;
   return stats;
 }
+
+/** Send counts per campaign, with the same `sent` semantics as sendStats. */
+export async function campaignSendStats(
+  db: D1Database,
+): Promise<Map<string, { sent: number; failed: number; duplicate: number; recovered: number }>> {
+  const { results } = await db
+    .prepare(`SELECT campaign_id, status, COUNT(*) AS n FROM sends GROUP BY campaign_id, status`)
+    .all<{ campaign_id: string; status: string; n: number }>();
+
+  const byCampaign = new Map<string, { sent: number; failed: number; duplicate: number; recovered: number }>();
+  for (const r of results) {
+    const stats = byCampaign.get(r.campaign_id) ?? { sent: 0, failed: 0, duplicate: 0, recovered: 0 };
+    if (r.status in stats) stats[r.status as keyof typeof stats] = r.n;
+    byCampaign.set(r.campaign_id, stats);
+  }
+  for (const stats of byCampaign.values()) stats.sent += stats.recovered;
+  return byCampaign;
+}
