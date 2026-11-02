@@ -438,6 +438,8 @@ Running:
 | Nothing routes to the right account | Match on `user_id` (`17841…`), not the app-scoped `id`. Both come back from `/me` |
 | Campaign never fires and nothing is wrong with it | Another active campaign shadows it — same account, keyword, and scope. The dashboard flags this |
 | 1101 right after a deploy adding a DO method | The warm Durable Object is still on old code. Retry once it cycles |
+| Story replies get no DM and leave no row in the send log | The campaign's "Also answer replies to your stories" box is off, or the webhook isn't subscribed to `messages`. A reply nothing matches is skipped before D1, so only `npm run tail` shows it, and only live |
+| Need logs from before you started `npm run tail` | The `wrangler login` token is refused (`Forbidden`) by the Workers Observability API. Read them in the Cloudflare dashboard instead |
 
 ---
 
