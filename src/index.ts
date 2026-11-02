@@ -727,9 +727,15 @@ export async function handleStoryReply(
   const linkUrl = link ? (wrapped ? `https://${host}/l/${link.code}` : link.targetUrl) : "";
   const substitute = (s: string) =>
     s.replace(/\{username\}/g, "there").replace(/\{link\}/g, linkUrl);
-  const message = linkUrl && !campaign.dmMessage.includes("{link}")
-    ? `${substitute(campaign.dmMessage)}\n\n${linkUrl}`
-    : substitute(campaign.dmMessage);
+  const text = substitute(campaign.dmMessage);
+  // The button template caps its text at 640 characters; past that Meta refuses
+  // the whole send, so a long message keeps the link inline instead.
+  const button = linkUrl && text.length <= BUTTON_TEXT_MAX
+    ? { title: BUTTON_TITLE, url: linkUrl }
+    : undefined;
+  const message = linkUrl && !button && !campaign.dmMessage.includes("{link}")
+    ? `${text}\n\n${linkUrl}`
+    : text;
 
   return account.deliver({
     igUserId: reply.igUserId,
@@ -740,11 +746,16 @@ export async function handleStoryReply(
     commentId: reply.messageId,
     commenterId: reply.senderId,
     message,
+    button,
     // No comment to sit under, so nothing public to post. Passing the campaign's
     // public reply here would try to reply to a message id and fail every time.
     successStatus: "sent",
   });
 }
+
+const BUTTON_TEXT_MAX = 640;
+// shortcut: one fixed label for every campaign; make it a campaign field if one needs its own.
+const BUTTON_TITLE = "Abrir enlace";
 
 /**
  * Automated fetchers only.

@@ -46,6 +46,8 @@ export interface SendJob {
   mediaId?: string;
   /** Fully substituted; the DO never sees a template. */
   message: string;
+  /** For a `dm`, the link as a button under `message` rather than inside it. */
+  button?: { title: string; url: string };
   publicReply?: string;
   /** 'sent' for a webhook, 'recovered' when reconciliation found the comment. */
   successStatus: string;
@@ -208,7 +210,7 @@ export class AccountDO extends DurableObject<SendEnv> {
 
     const result =
       job.kind === "dm"
-        ? await sendMessage(job.igUserId, job.recipientId ?? job.commenterId, job.message, token)
+        ? await sendMessage(job.igUserId, job.recipientId ?? job.commenterId, job.message, token, job.button)
         : await sendPrivateReply(job.igUserId, job.commentId, job.message, token);
 
     if (result.ok) {

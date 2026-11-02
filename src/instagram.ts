@@ -674,10 +674,25 @@ export async function sendMessage(
   recipientId: string,
   text: string,
   accessToken: string,
+  button?: { title: string; url: string },
 ): Promise<SendResult> {
+  // A button template rather than a URL in the text: Instagram doesn't always
+  // make a bare link in a DM tappable, but a web_url button always opens.
+  const message = button
+    ? {
+        attachment: {
+          type: "template",
+          payload: {
+            template_type: "button",
+            text,
+            buttons: [{ type: "web_url", url: button.url, title: button.title }],
+          },
+        },
+      }
+    : { text };
   return post(`${GRAPH_HOST}/${API_VERSION}/${igUserId}/messages`, accessToken, {
     recipient: { id: recipientId },
-    message: { text },
+    message,
   });
 }
 

@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as db from "../../src/db";
 import { handleStoryReply } from "../../src/index";
 import { IG_USER_ID } from "../fixtures";
@@ -95,5 +95,62 @@ describe("handleStoryReply routing", () => {
     expect(await handleStoryReply(reply({ text: "HELL YA" }), env, "freeply.test")).not.toBe(
       "no-match",
     );
+  });
+});
+
+describe("handleStoryReply message shape", () => {
+  let bodies: Record<string, unknown>[] = [];
+
+  beforeEach(() => {
+    bodies = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")));
+        return new Response(JSON.stringify({ message_id: "mid_sent" }), { status: 200 });
+      }),
+    );
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  /**
+   * Instagram doesn't always make a bare URL in a DM tappable, so the link goes
+   * on a button. Still the tracked link, so the click is still counted.
+   */
+  it("puts the link on a button rather than in the text", async () => {
+    const linkId = db.newId();
+    await db.saveLink(env.DB, { id: linkId, code: "abc1234", targetUrl: "https://example.com/r" });
+    await campaign({ linkId });
+
+    expect(await handleStoryReply(reply(), env, "freeply.test")).toBe("sent");
+    expect(bodies[0].message).toEqual({
+      attachment: {
+        type: "template",
+        payload: {
+          template_type: "button",
+          text: "Here you go",
+          buttons: [{ type: "web_url", url: "https://freeply.test/l/abc1234", title: "Abrir enlace" }],
+        },
+      },
+    });
+  });
+
+  it("sends plain text when the campaign has no link", async () => {
+    await campaign();
+
+    expect(await handleStoryReply(reply(), env, "freeply.test")).toBe("sent");
+    expect(bodies[0].message).toEqual({ text: "Here you go" });
+  });
+
+  /** The template caps text at 640 characters; past that Meta refuses the send. */
+  it("falls back to the link in the text when it's too long for a button", async () => {
+    const linkId = db.newId();
+    await db.saveLink(env.DB, { id: linkId, code: "long123", targetUrl: "https://example.com/r" });
+    const long = "x".repeat(641);
+    await campaign({ linkId, dmMessage: long });
+
+    expect(await handleStoryReply(reply(), env, "freeply.test")).toBe("sent");
+    expect(bodies[0].message).toEqual({ text: `${long}\n\nhttps://freeply.test/l/long123` });
   });
 });

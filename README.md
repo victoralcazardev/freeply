@@ -25,7 +25,8 @@ can read end to end.
 - Per-post results: DMs sent measured against the reach of the post that produced them.
 - **Story replies**, off by default per campaign. A reply to your story arrives as an
   ordinary inbound DM, so the 24-hour window is already open — no private reply spent,
-  no one-shot limit, no 7-day deadline. Account-wide campaigns only.
+  no one-shot limit, no 7-day deadline. Account-wide campaigns only. The campaign's link
+  goes on a button under the message rather than in its text.
 - **Ice Breakers**: the tappable questions Instagram shows someone opening a DM with
   you for the first time. One per campaign, published to Meta from the dashboard; a tap
   routes straight to that campaign.
@@ -503,10 +504,11 @@ as proven. In particular:
   transient split are written against Meta's documented error codes.
 - **The post picker calls `GET /me/media`, which hasn't been exercised live either.** If it
   returns nothing the form falls back to the raw post ID field, so this one fails softly.
-- **Story replies and Ice Breakers have never run against live Meta at all.** They're the
-  newest thing here, they need the `messages` and `messaging_postbacks` webhook fields
-  subscribed, and whether Meta delivers a story reply with the story id attached — which
-  is what per-story dedupe depends on — has only been assumed, not observed.
+- **Ice Breakers have never run against live Meta at all.** They need the
+  `messaging_postbacks` webhook field subscribed.
+- **Story replies have answered live, link button included.** Whether Meta delivers a
+  story reply with the story id attached — which per-story dedupe depends on — has only
+  been assumed, not observed.
 - **Whether Meta's one-shot rule is per comment or per commenter is an assumption.** An
   account-wide campaign answering the same person on a second post depends on it being
   per comment. The evidence is a thread observed on someone else's account, not a test on
