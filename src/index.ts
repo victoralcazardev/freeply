@@ -23,6 +23,7 @@ import {
   subscribeToComments,
 } from "./instagram";
 import { dataDeletionPage, privacyPage } from "./pages";
+import { extractProspectEvents, handleProspectEvents } from "./prospects";
 
 export interface Env {
   DB: D1Database;
@@ -42,9 +43,6 @@ export interface Env {
 
   /** Bearer token for the /api/* JSON endpoints. Unset turns them off (404). */
   API_TOKEN?: string;
-
-  /** sha256 hex of the one test M1 the T3 probe waits for. Unset: m1_match=n/a. */
-  PROBE_M1_SHA256?: string;
 }
 
 export { AccountDO } from "./account-do";
@@ -501,6 +499,7 @@ async function receiveEvent(
   const comments = extractComments(payload);
   const storyReplies = extractStoryReplies(payload);
   const postbacks = extractPostbacks(payload);
+  const prospects = extractProspectEvents(payload);
   if (comments.length === 0 && storyReplies.length === 0 && postbacks.length === 0) {
     // A delivery we can't read is the one failure that looked exactly like
     // success: 200 back to Meta, nothing logged, nothing sent. Print where it
@@ -516,10 +515,10 @@ async function receiveEvent(
       `webhook carried nothing we act on — change fields: [${fields.join(", ")}] ` +
         `messaging events: ${messaging}`,
     );
-    // shortcut: temporary metadata probe for the prospecting design (agency-os
-    // odd/tasks/instagram-coproduccion.md, T3); remove once T4 lands.
-    for (const line of await probeMessaging(payload, env.PROBE_M1_SHA256)) console.log(line);
   }
+  // Prospect writes run behind the 200 like every other delivery. An unknown
+  // peer is dropped inside the handler, before any write or log.
+  if (prospects.length > 0) ctx.waitUntil(handleProspectEvents(prospects, env.DB));
 
   for (const comment of comments) {
     console.log("comment", JSON.stringify(comment));
@@ -881,35 +880,6 @@ export interface StoryReplyEvent {
  * message as an answer to a story rather than someone starting a conversation,
  * and freeply has no business auto-answering the latter.
  */
-/**
- * Metadata only, never text or raw ids: whether an event is an echo, whether it
- * names a counterpart, a short hash of that counterpart (to pair an echo with
- * the reply), and whether its text matches the one test M1 we expect.
- */
-export async function probeMessaging(
-  payload: InstagramWebhookPayload,
-  expectedSha?: string,
-): Promise<string[]> {
-  const hex = async (s: string) =>
-    [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))]
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-  const lines: string[] = [];
-  for (const e of payload.entry ?? []) {
-    for (const m of e.messaging ?? []) {
-      const echo = Boolean(m.is_echo || m.message?.is_echo);
-      const peer = echo ? m.recipient?.id : m.sender?.id;
-      const text = m.message?.text;
-      const match = expectedSha && text ? (await hex(text.trim())) === expectedSha : null;
-      lines.push(
-        `probe echo=${echo} peer=${peer ? (await hex(peer)).slice(0, 8) : "none"} ` +
-          `text=${text ? "yes" : "no"} m1_match=${match === null ? "n/a" : match}`,
-      );
-    }
-  }
-  return lines;
-}
-
 export function extractStoryReplies(payload: InstagramWebhookPayload): StoryReplyEvent[] {
   const events: StoryReplyEvent[] = [];
   for (const entry of payload.entry ?? []) {

@@ -386,6 +386,185 @@ export async function setReconcileCursor(db: D1Database, cursor: number): Promis
     .run();
 }
 
+/* ------------------------------------------------------- prospect threads */
+
+export type ProspectState = "m1_pendiente" | "m1_sin_confirmar" | "enrolled" | "closed";
+
+export interface ProspectThread {
+  leadId: string;
+  igUserId: string;
+  igsid: string | null;
+  handle: string;
+  state: ProspectState;
+  m1Sha: string | null;
+  version: number;
+}
+
+interface ProspectThreadRow {
+  lead_id: string;
+  ig_user_id: string;
+  igsid: string | null;
+  handle: string;
+  state: string;
+  m1_sha: string | null;
+  version: number;
+}
+
+const toProspectThread = (r: ProspectThreadRow): ProspectThread => ({
+  leadId: r.lead_id,
+  igUserId: r.ig_user_id,
+  igsid: r.igsid,
+  handle: r.handle,
+  state: r.state as ProspectState,
+  m1Sha: r.m1_sha,
+  version: r.version,
+});
+
+/**
+ * Pending threads whose expected M1 has exactly this normalized hash.
+ *
+ * The caller must require exactly one. More than one means the same text was
+ * copied for two leads, and choosing either would be a guess about identity.
+ */
+export async function pendingM1Threads(
+  db: D1Database,
+  igUserId: string,
+  m1Sha: string,
+): Promise<ProspectThread[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT lead_id, ig_user_id, igsid, handle, state, m1_sha, version
+       FROM prospect_threads
+       WHERE ig_user_id = ? AND state = 'm1_pendiente'
+         AND igsid IS NULL AND m1_sha = ?
+       ORDER BY lead_id`,
+    )
+    .bind(igUserId, m1Sha)
+    .all<ProspectThreadRow>();
+
+  return results.map(toProspectThread);
+}
+
+/** The enrolled thread a peer id belongs to on this account, if any. */
+export async function enrolledThreadByIgsid(
+  db: D1Database,
+  igUserId: string,
+  igsid: string,
+): Promise<ProspectThread | null> {
+  const row = await db
+    .prepare(
+      `SELECT lead_id, ig_user_id, igsid, handle, state, m1_sha, version
+       FROM prospect_threads
+       WHERE ig_user_id = ? AND igsid = ? AND state = 'enrolled'`,
+    )
+    .bind(igUserId, igsid)
+    .first<ProspectThreadRow>();
+
+  return row ? toProspectThread(row) : null;
+}
+
+/**
+ * Enrolls the matched pending thread and stores the M1 echo as one step.
+ *
+ * The update is conditioned on the state and version read before it, so a
+ * duplicate delivery cannot enroll twice or bump the conversation version twice.
+ * The message insert only fires if that update won the race, and `mid` dedupes a
+ * redelivery even then.
+ */
+export async function enrollProspectThread(
+  db: D1Database,
+  t: {
+    leadId: string;
+    igUserId: string;
+    igsid: string;
+    mid: string;
+    text: string;
+    sentAt: number;
+    expectedVersion: number;
+  },
+): Promise<boolean> {
+  const now = Date.now();
+  const nextVersion = t.expectedVersion + 1;
+  const results = await db.batch([
+    db
+      .prepare(
+        `UPDATE prospect_threads
+         SET igsid = ?, state = 'enrolled', version = version + 1,
+             last_outbound_at = ?, updated_at = ?
+         WHERE lead_id = ? AND ig_user_id = ? AND state = 'm1_pendiente'
+           AND igsid IS NULL AND version = ?`,
+      )
+      .bind(t.igsid, t.sentAt, now, t.leadId, t.igUserId, t.expectedVersion),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO prospect_messages
+           (mid, lead_id, direction, origin, text, sent_at, created_at)
+         SELECT ?, ?, 'out', 'echo_m1', ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM prospect_threads
+           WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled'
+             AND igsid = ? AND version = ?
+         )`,
+      )
+      .bind(
+        t.mid,
+        t.leadId,
+        t.text,
+        t.sentAt,
+        now,
+        t.leadId,
+        t.igUserId,
+        t.igsid,
+        nextVersion,
+      ),
+  ]);
+
+  return (results[0]?.meta.changes ?? 0) > 0;
+}
+
+/**
+ * Stores one inbound message and advances the thread version, once per `mid`.
+ *
+ * The NOT EXISTS clause keeps the version from moving on a redelivery even
+ * before the insert reaches its own unique key.
+ */
+export async function recordProspectInbound(
+  db: D1Database,
+  t: {
+    leadId: string;
+    igUserId: string;
+    igsid: string;
+    mid: string;
+    text: string;
+    sentAt: number;
+  },
+): Promise<boolean> {
+  const now = Date.now();
+  const results = await db.batch([
+    db
+      .prepare(
+        `UPDATE prospect_threads
+         SET version = version + 1, last_inbound_at = ?, updated_at = ?
+         WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled' AND igsid = ?
+           AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)`,
+      )
+      .bind(t.sentAt, now, t.leadId, t.igUserId, t.igsid, t.mid),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO prospect_messages
+           (mid, lead_id, direction, origin, text, sent_at, created_at)
+         SELECT ?, ?, 'in', 'webhook', ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM prospect_threads
+           WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled' AND igsid = ?
+         )`,
+      )
+      .bind(t.mid, t.leadId, t.text, t.sentAt, now, t.leadId, t.igUserId, t.igsid),
+  ]);
+
+  return (results[0]?.meta.changes ?? 0) > 0;
+}
+
 /* --------------------------------------------------------------- campaigns */
 
 interface CampaignRow {
