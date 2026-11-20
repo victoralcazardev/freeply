@@ -12,12 +12,12 @@
   // Optional. Uncomment and point at a hostname on a Cloudflare zone you control to
   // serve from your own domain — worth it for tracked links, since a workers.dev URL
   // in a DM looks like a URL shortener. Leave it commented to stay domain-free.
-  // "routes": [{ "pattern": "freeply.example.com", "custom_domain": true }],
+  "routes": [{ "pattern": "bot.victoralcazar.com", "custom_domain": true }],
   "vars": {
     // Shown as the contact address on /privacy and /data-deletion. `npm run setup`
     // writes your OPERATOR_EMAIL from .dev.vars into this line — don't edit it by
     // hand, and don't commit the result.
-    "OPERATOR_EMAIL": "you@example.com",
+    "OPERATOR_EMAIL": "victoralcazarrodriguez@gmail.com",
   },
   "d1_databases": [
     {
@@ -26,7 +26,7 @@
       // Yours, not the author's. `npm run setup` creates the database on first run
       // and writes its id here. The edit is expected to stay local: it identifies
       // your Cloudflare resource, so leave it out of any commit or pull request.
-      "database_id": "SET_BY_NPM_RUN_SETUP",
+      "database_id": "7c8718ff-e0d4-4071-99d2-11068c307006",
       "migrations_dir": "migrations"
     }
   ],
