@@ -844,6 +844,312 @@ export async function insertProspectAuthorization(
     .run();
 }
 
+/* ------------------------------------------------- goals for the mobile page */
+
+/**
+ * A registered M1 with no echo after this long is shown as unconfirmed.
+ *
+ * Copying and sending are seconds apart on a phone, and the echo lands right
+ * after the send, so half an hour is already generous. The state is derived, not
+ * written: rendering the page never touches D1.
+ */
+export const M1_UNCONFIRMED_AFTER_MS = 30 * 60 * 1000;
+
+/** Meta stops letting the API answer a lead 24 h after their last message. */
+export const MESSAGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** From here the page flags the draft, so a slow session still has time left. */
+export const WINDOW_WARNING_MS = 20 * 60 * 60 * 1000;
+
+/** A thread waiting for its first DM, with the CLI's draft as the starting text. */
+export interface ProspectM1Item {
+  thread: ProspectThreadDetail;
+  /** The latest `m1` draft, or null when the CLI has not drafted one yet. */
+  text: string | null;
+}
+
+/**
+ * The two M1 queues: what to send now, and what was copied with no echo back.
+ *
+ * A thread whose text was copied less than `M1_UNCONFIRMED_AFTER_MS` ago stays in
+ * the first queue — the echo may still be in flight — and moves to the second
+ * after that, where the only way forward is copying it again.
+ */
+export async function prospectM1Queue(
+  db: D1Database,
+  now = Date.now(),
+): Promise<{ pending: ProspectM1Item[]; unconfirmed: ProspectM1Item[] }> {
+  const cutoff = now - M1_UNCONFIRMED_AFTER_MS;
+  const [pendingRows, unconfirmedRows] = await Promise.all([
+    db
+      .prepare(
+        `SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads
+         WHERE state = 'm1_pendiente'
+           AND (m1_registered_at IS NULL OR m1_registered_at > ?)
+         ORDER BY created_at ASC, lead_id ASC`,
+      )
+      .bind(cutoff)
+      .all<ProspectThreadDetailRow>(),
+    // `m1_sin_confirmar` is written when the same text was pending on two leads;
+    // the time branch is the copy whose echo never came back.
+    db
+      .prepare(
+        `SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads
+         WHERE state = 'm1_sin_confirmar'
+            OR (state = 'm1_pendiente' AND m1_registered_at IS NOT NULL
+                AND m1_registered_at <= ?)
+         ORDER BY COALESCE(m1_registered_at, created_at) ASC, lead_id ASC`,
+      )
+      .bind(cutoff)
+      .all<ProspectThreadDetailRow>(),
+  ]);
+
+  const pending = pendingRows.results.map(toProspectThreadDetail);
+  const unconfirmed = unconfirmedRows.results.map(toProspectThreadDetail);
+  const texts = await latestM1Texts(db, [...pending, ...unconfirmed].map((t) => t.leadId));
+  const withText = (t: ProspectThreadDetail): ProspectM1Item => ({
+    thread: t,
+    text: texts.get(t.leadId) ?? null,
+  });
+
+  return { pending: pending.map(withText), unconfirmed: unconfirmed.map(withText) };
+}
+
+/** The CLI's latest M1 draft per lead — the starting point of the editable box. */
+async function latestM1Texts(
+  db: D1Database,
+  leadIds: readonly string[],
+): Promise<Map<string, string>> {
+  const texts = new Map<string, string>();
+  for (const ids of chunk(leadIds)) {
+    const { results } = await db
+      .prepare(
+        `SELECT draft_id, lead_id, kind, stage, text, base_version, status, decided_at,
+                decided_text, created_at
+         FROM prospect_drafts
+         WHERE kind = 'm1' AND lead_id IN (${ids.map(() => "?").join(", ")})
+         ORDER BY created_at ASC, draft_id ASC`,
+      )
+      .bind(...ids)
+      .all<ProspectDraftRow>();
+    // Oldest first, so the last write for a lead is the draft it should show.
+    for (const row of results) texts.set(row.lead_id, row.text);
+  }
+  return texts;
+}
+
+/** A reply draft with the thread it belongs to and the lead's latest message. */
+export interface ProspectQueueItem {
+  thread: ProspectThreadDetail;
+  draft: ProspectDraft;
+  inbound: ProspectMessage | null;
+}
+
+/**
+ * Reply drafts waiting for the operator's OK, oldest wait first.
+ *
+ * Only threads still inside the 24 h window: a draft past it cannot be answered
+ * by the API, so it belongs in the manual queue rather than here.
+ */
+export async function prospectDraftQueue(
+  db: D1Database,
+  now = Date.now(),
+): Promise<ProspectQueueItem[]> {
+  const cutoff = now - MESSAGE_WINDOW_MS;
+  const items = await replyDraftItems(db, ["waiting"]);
+
+  return items
+    .filter(
+      (i) =>
+        i.thread.state === "enrolled" &&
+        i.thread.lastInboundAt !== null &&
+        i.thread.lastInboundAt > cutoff,
+    )
+    .sort((a, b) => (a.thread.lastInboundAt ?? 0) - (b.thread.lastInboundAt ?? 0));
+}
+
+/**
+ * What a person has to do by hand: the window is closed, or a send was cut off
+ * with no way to know whether it arrived.
+ *
+ * `send_state_unknown` is never retried automatically — retrying would risk two
+ * messages — so a person looks at the thread and says which happened.
+ */
+export interface ProspectManualItem extends ProspectQueueItem {
+  reason: "window_closed" | "send_state_unknown";
+}
+
+export async function prospectManualQueue(
+  db: D1Database,
+  now = Date.now(),
+): Promise<ProspectManualItem[]> {
+  const cutoff = now - MESSAGE_WINDOW_MS;
+  const items = await replyDraftItems(db, ["waiting", "send_state_unknown"]);
+  const manual: ProspectManualItem[] = [];
+
+  for (const item of items) {
+    if (item.draft.status === "send_state_unknown") {
+      manual.push({ ...item, reason: "send_state_unknown" });
+      continue;
+    }
+    const { thread } = item;
+    const open =
+      thread.state === "enrolled" &&
+      thread.lastInboundAt !== null &&
+      thread.lastInboundAt > cutoff;
+    if (!open) manual.push({ ...item, reason: "window_closed" });
+  }
+
+  return manual.sort(
+    (a, b) =>
+      (a.thread.lastInboundAt ?? a.draft.createdAt) -
+      (b.thread.lastInboundAt ?? b.draft.createdAt),
+  );
+}
+
+/** Reply drafts in the given statuses, with their thread and latest inbound. */
+async function replyDraftItems(
+  db: D1Database,
+  statuses: readonly ProspectDraftStatus[],
+): Promise<ProspectQueueItem[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT draft_id, lead_id, kind, stage, text, base_version, status, decided_at,
+              decided_text, created_at
+       FROM prospect_drafts
+       WHERE kind = 'reply' AND status IN (${statuses.map(() => "?").join(", ")})
+       ORDER BY created_at ASC, draft_id ASC`,
+    )
+    .bind(...statuses)
+    .all<ProspectDraftRow>();
+
+  const drafts = results.map(toProspectDraft);
+  if (drafts.length === 0) return [];
+
+  const leadIds = [...new Set(drafts.map((d) => d.leadId))];
+  const threads = new Map((await prospectThreadsByIds(db, leadIds)).map((t) => [t.leadId, t]));
+  const inbound = await latestInboundMessages(db, leadIds);
+
+  return drafts.flatMap((draft) => {
+    const thread = threads.get(draft.leadId);
+    // A draft whose thread is gone has nothing to show; the foreign key already
+    // means it cannot happen, and a page is the wrong place to find out.
+    if (!thread) return [];
+    return [{ thread, draft, inbound: inbound.get(draft.leadId) ?? null }];
+  });
+}
+
+async function prospectThreadsByIds(
+  db: D1Database,
+  leadIds: readonly string[],
+): Promise<ProspectThreadDetail[]> {
+  const threads: ProspectThreadDetail[] = [];
+  for (const ids of chunk(leadIds)) {
+    const { results } = await db
+      .prepare(
+        `SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads
+         WHERE lead_id IN (${ids.map(() => "?").join(", ")})`,
+      )
+      .bind(...ids)
+      .all<ProspectThreadDetailRow>();
+    threads.push(...results.map(toProspectThreadDetail));
+  }
+  return threads;
+}
+
+/** Each thread's latest inbound message — what the reply is answering. */
+async function latestInboundMessages(
+  db: D1Database,
+  leadIds: readonly string[],
+): Promise<Map<string, ProspectMessage>> {
+  const latest = new Map<string, ProspectMessage>();
+  for (const ids of chunk(leadIds)) {
+    const { results } = await db
+      .prepare(
+        `SELECT mid, lead_id, direction, origin, text, sent_at, drafted_at, answered_at
+         FROM prospect_messages
+         WHERE direction = 'in' AND lead_id IN (${ids.map(() => "?").join(", ")})
+         ORDER BY sent_at ASC, mid ASC`,
+      )
+      .bind(...ids)
+      .all<ProspectMessageRow>();
+    for (const row of results) latest.set(row.lead_id, toProspectMessage(row));
+  }
+  return latest;
+}
+
+/**
+ * The ambiguous echo of T4's design: the same copied text was pending on two
+ * leads, so which one received it is unknowable. Neither enrolls; both come back
+ * to the operator with a retry.
+ */
+export async function markAmbiguousM1Threads(
+  db: D1Database,
+  igUserId: string,
+  m1Sha: string,
+  now = Date.now(),
+): Promise<number> {
+  const result = await db
+    .prepare(
+      `UPDATE prospect_threads SET state = 'm1_sin_confirmar', updated_at = ?
+       WHERE ig_user_id = ? AND state = 'm1_pendiente' AND igsid IS NULL AND m1_sha = ?`,
+    )
+    .bind(now, igUserId, m1Sha)
+    .run();
+
+  return result.meta.changes ?? 0;
+}
+
+/**
+ * "Reintentar" on an unconfirmed M1: back to the send queue with nothing
+ * registered, because the hash it had points at a text nobody sent.
+ */
+export async function retryProspectM1(
+  db: D1Database,
+  leadId: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE prospect_threads
+       SET state = 'm1_pendiente', m1_sha = NULL, m1_registered_at = NULL, updated_at = ?
+       WHERE lead_id = ? AND igsid IS NULL
+         AND state IN ('m1_pendiente', 'm1_sin_confirmar')`,
+    )
+    .bind(now, leadId)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+/**
+ * One draft decision, as the page records it.
+ *
+ * `from` is the status the caller believes the draft is in: an approval that
+ * races a decision already made changes nothing and says so, rather than
+ * overwriting an answer somebody gave a moment earlier.
+ */
+export async function decideProspectDraft(
+  db: D1Database,
+  d: {
+    draftId: string;
+    from: readonly ProspectDraftStatus[];
+    status: ProspectDraftStatus;
+    decidedText: string | null;
+    decidedAt: number | null;
+  },
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE prospect_drafts SET status = ?, decided_text = ?, decided_at = ?
+       WHERE draft_id = ? AND status IN (${d.from.map(() => "?").join(", ")})`,
+    )
+    .bind(d.status, d.decidedText, d.decidedAt, d.draftId, ...d.from)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
 /** The lead's latest message, per thread — the one a reply has to answer. */
 const LATEST_MESSAGE =
   `(SELECT x.mid FROM prospect_messages x

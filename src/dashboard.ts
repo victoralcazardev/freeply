@@ -11,6 +11,9 @@ export function esc(s: unknown): string {
 
 export type Tab = "overview" | "campaigns" | "links" | "settings";
 
+/** Every page in the dashboard's frame, including the ones outside `Tab`. */
+export type NavTab = Tab | "prospects";
+
 /**
  * Prefilled campaign copy. Values, not placeholders — a new campaign should be a
  * keyword and a URL away from finished.
@@ -117,13 +120,46 @@ a:has(.post) { text-decoration: none; color: inherit; }
 a:has(.post):hover span { color: var(--accent); }
 `;
 
-function page(title: string, body: string): Response {
+export function page(
+  title: string,
+  body: string,
+  opts: { lang?: string; css?: string } = {},
+): Response {
   return new Response(
-    `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+    `<!doctype html><html lang="${esc(opts.lang ?? "en")}"><head><meta charset="utf-8">` +
       `<meta name="viewport" content="width=device-width,initial-scale=1">` +
-      `<title>${esc(title)} — Freeply</title><style>${STYLE}</style></head>` +
+      `<title>${esc(title)} — Freeply</title><style>${STYLE}${opts.css ?? ""}</style></head>` +
       `<body><div class="wrap">${body}</div></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } },
+  );
+}
+
+/**
+ * The frame every page shares: brand, sign-out, nav.
+ *
+ * Only the dashboard itself shows the account alerts — they are about sending,
+ * and a page that is not sending anything has no use for them.
+ */
+export function chrome(opts: {
+  host: string;
+  tab: NavTab;
+  body: string;
+  title?: string;
+  lang?: string;
+  css?: string;
+}): Response {
+  return page(
+    opts.title ?? "Dashboard",
+    `<header>
+       <h1>Freeply</h1>
+       <span class="muted small">${esc(opts.host)}</span>
+       <form method="post" action="/logout" style="margin-left:auto">
+         <button class="small">Sign out</button>
+       </form>
+     </header>
+     ${nav(opts.tab)}
+     ${opts.body}`,
+    { lang: opts.lang, css: opts.css },
   );
 }
 
@@ -235,17 +271,20 @@ function alerts(accounts: Account[], shadowedCount: number): string {
   return items.map((i) => `<div class="alert">${i}</div>`).join("");
 }
 
-function nav(tab: Tab): string {
-  const tabs: Array<[Tab, string]> = [
+export function nav(tab: NavTab): string {
+  const tabs: Array<[NavTab, string]> = [
     ["overview", "Overview"],
     ["campaigns", "Campaigns"],
     ["links", "Links"],
+    ["prospects", "Prospectos"],
     ["settings", "Settings"],
   ];
+  // Every tab but one is a dashboard tab; the mobile page is its own route.
+  const href = (id: NavTab) => (id === "prospects" ? "/prospects" : `/?tab=${id}`);
   return `<nav>${tabs
     .map(
       ([id, label]) =>
-        `<a href="/?tab=${id}" class="${tab === id ? "on" : ""}">${label}</a>`,
+        `<a href="${href(id)}" class="${tab === id ? "on" : ""}">${label}</a>`,
     )
     .join("")}</nav>`;
 }
@@ -279,20 +318,13 @@ export function dashboardPage(data: {
           ? settingsTab(accounts, campaigns)
           : overviewTab(stats, posts, sends, filter);
 
-  return page(
-    "Dashboard",
-    `<header>
-       <h1>Freeply</h1>
-       <span class="muted small">${esc(host)}</span>
-       <form method="post" action="/logout" style="margin-left:auto">
-         <button class="small">Sign out</button>
-       </form>
-     </header>
-     ${filter.error ? `<div class="alert">${esc(filter.error)}</div>` : ""}
+  return chrome({
+    host,
+    tab,
+    body: `${filter.error ? `<div class="alert">${esc(filter.error)}</div>` : ""}
      ${alerts(accounts, shadowed.size)}
-     ${nav(tab)}
      ${body}`,
-  );
+  });
 }
 
 /* ---------------------------------------------------------------- overview */

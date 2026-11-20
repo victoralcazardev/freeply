@@ -1,7 +1,7 @@
 import { fail, invalid, json, jsonBody, limitParam } from "./api";
 import * as db from "./db";
 import type { Env } from "./index";
-import { prospectTextSha } from "./prospects";
+import { registerExpectedM1 } from "./prospects";
 
 /**
  * The prospect API the Pi-side CLI and the mobile page talk to.
@@ -142,9 +142,7 @@ export async function handleProspectsApi(
   const path = url.pathname;
 
   if (path === "/api/prospects/threads" && method === "POST") return createThread(request, env);
-  if (path === "/api/prospects/expected-m1" && method === "POST") {
-    return registerExpectedM1(request, env);
-  }
+  if (path === "/api/prospects/expected-m1" && method === "POST") return registerM1(request, env);
   if (path === "/api/prospects/drafts" && method === "POST") return createDraft(request, env);
   if (path === "/api/prospects/work" && method === "GET") return work(env, url);
   if (path === "/api/prospects/authorizations" && method === "POST") {
@@ -201,21 +199,24 @@ async function createThread(request: Request, env: Env): Promise<Response> {
   const status = existing ? 200 : 201;
 
   if (m1Text === null) return json({ thread: presentThread(thread) }, status);
-  if (!(await db.registerProspectM1(env.DB, { leadId, m1Sha: await prospectTextSha(m1Text) }))) {
-    // The echo can land between the check above and this write.
-    return fail(409, "already_enrolled");
+  // Same registration the page's "copiar" performs, so there is one writer for
+  // `m1_sha` and one set of rules about what may be armed.
+  const registered = await registerExpectedM1(env.DB, leadId, m1Text);
+  if (!registered.ok) {
+    return fail(registered.error === "not_found" ? 404 : 409, registered.error);
   }
-
-  const armed = await db.getProspectThread(env.DB, leadId);
-  return json({ thread: presentThread(armed ?? thread) }, status);
+  return json({ thread: presentThread(registered.thread) }, status);
 }
 
 /**
  * Registers the text the operator copied. The echo of that exact text is the
  * only thing that enrolls the thread, so this is the last moment the pairing can
  * be made — and re-registering is how a failed M1 is retried.
+ *
+ * The rules live in `registerExpectedM1`, shared with the mobile page's copy
+ * button; this handler only decides the status code.
  */
-async function registerExpectedM1(request: Request, env: Env): Promise<Response> {
+async function registerM1(request: Request, env: Env): Promise<Response> {
   const body = await jsonBody(request);
   if (body instanceof Response) return body;
 
@@ -224,21 +225,9 @@ async function registerExpectedM1(request: Request, env: Env): Promise<Response>
   const text = required(body.text, "text", MAX_TEXT_BYTES);
   if (text instanceof Response) return text;
 
-  const thread = await db.getProspectThread(env.DB, leadId);
-  if (!thread) return fail(404, "not_found");
-  if (thread.igsid !== null) return fail(409, "already_enrolled");
-  if (thread.state === "closed") return fail(409, "thread_closed");
-
-  // The echo is compared in normalized form, so the hash comes from that form.
-  const m1Sha = await prospectTextSha(text);
-  if (!(await db.registerProspectM1(env.DB, { leadId, m1Sha }))) {
-    // The echo can land between the read above and this write.
-    return fail(409, "already_enrolled");
-  }
-
-  const updated = await db.getProspectThread(env.DB, leadId);
-  if (!updated) return fail(404, "not_found");
-  return json({ thread: presentThread(updated) });
+  const result = await registerExpectedM1(env.DB, leadId, text);
+  if (!result.ok) return fail(result.error === "not_found" ? 404 : 409, result.error);
+  return json({ thread: presentThread(result.thread) });
 }
 
 /** The same draft_id is a retry, not a second draft. */

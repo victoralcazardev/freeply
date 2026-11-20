@@ -23,6 +23,7 @@ import {
   subscribeToComments,
 } from "./instagram";
 import { dataDeletionPage, privacyPage } from "./pages";
+import { handleProspectsPage } from "./prospects-page";
 import { extractProspectEvents, handleProspectEvents } from "./prospects";
 
 export interface Env {
@@ -149,6 +150,13 @@ export default {
         status: url.searchParams.get("status") ?? undefined,
         error: url.searchParams.get("error") ?? undefined,
       });
+    }
+
+    // The mobile page for the daily sessions, and the four queues it posts to
+    // (S8, S11). Same session as every other dashboard route; no other page in
+    // this Worker ever reads a registered lead's conversation.
+    if (path === "/prospects" || path.startsWith("/prospects/")) {
+      return handleProspectsPage(request, env, url);
     }
 
     if (request.method === "POST") {

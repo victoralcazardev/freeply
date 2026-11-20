@@ -296,7 +296,8 @@ describe("M1 echo enrollment", () => {
 
   /**
    * Same normalized text on two leads is not evidence of which one received the
-   * M1. Neither is enrolled, and neither is guessed at.
+   * M1. Neither is enrolled, neither is guessed at, and both land in the queue
+   * that asks a person to retry with a text only one of them will receive (T6).
    */
   it("enrolls neither thread and writes nothing when two pending M1s share the text", async () => {
     const m1 = "Hola, soy Víctor. ¿Cómo lo lleváis?";
@@ -310,7 +311,7 @@ describe("M1 echo enrollment", () => {
     for (const leadId of ["lead-a", "lead-b"]) {
       expect(await thread(leadId)).toMatchObject({
         igsid: null,
-        state: "m1_pendiente",
+        state: "m1_sin_confirmar",
         version: 0,
       });
     }

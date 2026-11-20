@@ -128,6 +128,9 @@ async function handleEcho(event: ProspectEvent, d1: D1Database): Promise<void> {
   }
   if (pending.length > 1) {
     // Same copied text on two leads is not evidence of which one received it.
+    // Neither enrolls, and both are handed back for a retry with a text only one
+    // of them will receive.
+    await db.markAmbiguousM1Threads(d1, event.igUserId, sha);
     console.log(`prospect echo: ambiguous pending=${pending.length}`);
     return;
   }
@@ -144,6 +147,88 @@ async function handleEcho(event: ProspectEvent, d1: D1Database): Promise<void> {
   });
 
   if (enrolled) console.log("prospect echo: enrolled");
+}
+
+/** Why registering an M1 failed, as both the API and the page report it. */
+export type M1Registration =
+  | { ok: true; thread: db.ProspectThreadDetail }
+  | { ok: false; error: "not_found" | "already_enrolled" | "thread_closed" };
+
+/**
+ * Records the text whose exact echo enrolls a thread — what "copiar" on the
+ * mobile page does, and what `POST /api/prospects/expected-m1` does.
+ *
+ * The page and the API share this so there is one place that decides what may be
+ * registered and one writer for `m1_sha`. It fails closed: an enrolled or closed
+ * thread is refused rather than left holding a hash that could never match.
+ */
+export async function registerExpectedM1(
+  d1: D1Database,
+  leadId: string,
+  text: string,
+): Promise<M1Registration> {
+  const thread = await db.getProspectThread(d1, leadId);
+  if (!thread) return { ok: false, error: "not_found" };
+  if (thread.igsid !== null) return { ok: false, error: "already_enrolled" };
+  if (thread.state === "closed") return { ok: false, error: "thread_closed" };
+
+  // The echo is compared in normalized form, so the hash comes from that form.
+  if (!(await db.registerProspectM1(d1, { leadId, m1Sha: await prospectTextSha(text) }))) {
+    // The echo can land between the read above and this write.
+    return { ok: false, error: "already_enrolled" };
+  }
+
+  const updated = await db.getProspectThread(d1, leadId);
+  if (!updated) return { ok: false, error: "not_found" };
+  return { ok: true, thread: updated };
+}
+
+/** Why approving a draft failed, as the page reports it. */
+export type DraftApproval =
+  | { ok: true; draft: db.ProspectDraft }
+  | {
+      ok: false;
+      error: "not_found" | "not_waiting" | "not_a_reply" | "empty_text";
+    };
+
+/**
+ * Records the operator's approval of a reply draft — the OK that used to be a
+ * Telegram message.
+ *
+ * The approved text is stored in `decided_text`, which is also what the
+ * graduation count reads: a draft sent as written graduates its stage, an edited
+ * one does not. Sending is T7's job and hooks in at the marked line.
+ */
+export async function approveProspectDraft(
+  d1: D1Database,
+  d: { draftId: string; text: string; now?: number },
+): Promise<DraftApproval> {
+  const draft = await db.getProspectDraft(d1, d.draftId);
+  if (!draft) return { ok: false, error: "not_found" };
+  if (draft.kind !== "reply") return { ok: false, error: "not_a_reply" };
+  if (draft.status !== "waiting") return { ok: false, error: "not_waiting" };
+
+  const decidedText = d.text.trim();
+  if (!decidedText) return { ok: false, error: "empty_text" };
+
+  const now = d.now ?? Date.now();
+  const decided = await db.decideProspectDraft(d1, {
+    draftId: d.draftId,
+    from: ["waiting"],
+    status: "approved",
+    decidedText,
+    decidedAt: now,
+  });
+  // Somebody else decided it between the read and this write.
+  if (!decided) return { ok: false, error: "not_waiting" };
+
+  // T7 sends from here: `sendApprovedDraft(d1, { draft, decidedText })`, whose
+  // five checks read the row this call just wrote. Nothing leaves the Worker
+  // before that line exists.
+  return {
+    ok: true,
+    draft: { ...draft, status: "approved", decidedText, decidedAt: now },
+  };
 }
 
 async function handleInbound(event: ProspectEvent, d1: D1Database): Promise<void> {
