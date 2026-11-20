@@ -500,14 +500,18 @@ async function receiveEvent(
   const postbacks = extractPostbacks(payload);
   if (comments.length === 0 && storyReplies.length === 0 && postbacks.length === 0) {
     // A delivery we can't read is the one failure that looked exactly like
-    // success: 200 back to Meta, nothing logged, nothing sent. Print what did
-    // arrive so the field name it came under is visible.
+    // success: 200 back to Meta, nothing logged, nothing sent. Print where it
+    // arrived, never the body: plain DMs land here and are private.
     const fields = (payload.entry ?? [])
       .flatMap((e) => e.changes ?? [])
       .map((c) => c.field ?? "?");
+    const messaging = (payload.entry ?? []).reduce(
+      (n, e) => n + ((e as { messaging?: unknown[] }).messaging?.length ?? 0),
+      0,
+    );
     console.log(
       `webhook carried nothing we act on — change fields: [${fields.join(", ")}] ` +
-        `body: ${JSON.stringify(payload).slice(0, 800)}`,
+        `messaging events: ${messaging}`,
     );
   }
 
