@@ -565,6 +565,442 @@ export async function recordProspectInbound(
   return (results[0]?.meta.changes ?? 0) > 0;
 }
 
+/* ------------------------------------------------------- prospect API rows */
+
+/**
+ * A thread as the JSON API reports it. `igsid` is deliberately absent: it is
+ * how the webhook recognises a lead, not something a client has any use for.
+ */
+export interface ProspectThreadDetail {
+  leadId: string;
+  igUserId: string;
+  igsid: string | null;
+  handle: string;
+  name: string | null;
+  nicho: string | null;
+  state: ProspectState;
+  m1Sha: string | null;
+  m1RegisteredAt: number | null;
+  version: number;
+  lastInboundAt: number | null;
+  lastOutboundAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface ProspectThreadDetailRow {
+  lead_id: string;
+  ig_user_id: string;
+  igsid: string | null;
+  handle: string;
+  name: string | null;
+  nicho: string | null;
+  state: string;
+  m1_sha: string | null;
+  m1_registered_at: number | null;
+  version: number;
+  last_inbound_at: number | null;
+  last_outbound_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+const PROSPECT_THREAD_COLUMNS = `lead_id, ig_user_id, igsid, handle, name, nicho, state, m1_sha,
+         m1_registered_at, version, last_inbound_at, last_outbound_at, created_at, updated_at`;
+
+const toProspectThreadDetail = (r: ProspectThreadDetailRow): ProspectThreadDetail => ({
+  leadId: r.lead_id,
+  igUserId: r.ig_user_id,
+  igsid: r.igsid,
+  handle: r.handle,
+  name: r.name,
+  nicho: r.nicho,
+  state: r.state as ProspectState,
+  m1Sha: r.m1_sha,
+  m1RegisteredAt: r.m1_registered_at,
+  version: r.version,
+  lastInboundAt: r.last_inbound_at,
+  lastOutboundAt: r.last_outbound_at,
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+export type ProspectDraftKind = "m1" | "reply";
+export type ProspectDraftStatus =
+  | "waiting"
+  | "approved"
+  | "invalidated"
+  | "skipped"
+  | "sent"
+  | "expired"
+  | "send_state_unknown";
+
+export interface ProspectDraft {
+  draftId: string;
+  leadId: string;
+  kind: ProspectDraftKind;
+  stage: string | null;
+  text: string;
+  baseVersion: number;
+  status: ProspectDraftStatus;
+  decidedAt: number | null;
+  decidedText: string | null;
+  createdAt: number;
+}
+
+interface ProspectDraftRow {
+  draft_id: string;
+  lead_id: string;
+  kind: string;
+  stage: string | null;
+  text: string;
+  base_version: number;
+  status: string;
+  decided_at: number | null;
+  decided_text: string | null;
+  created_at: number;
+}
+
+const toProspectDraft = (r: ProspectDraftRow): ProspectDraft => ({
+  draftId: r.draft_id,
+  leadId: r.lead_id,
+  kind: r.kind as ProspectDraftKind,
+  stage: r.stage,
+  text: r.text,
+  baseVersion: r.base_version,
+  status: r.status as ProspectDraftStatus,
+  decidedAt: r.decided_at,
+  decidedText: r.decided_text,
+  createdAt: r.created_at,
+});
+
+export interface ProspectMessage {
+  mid: string;
+  leadId: string;
+  direction: "in" | "out";
+  origin: string;
+  text: string;
+  sentAt: number;
+  draftedAt: number | null;
+  answeredAt: number | null;
+}
+
+interface ProspectMessageRow {
+  mid: string;
+  lead_id: string;
+  direction: string;
+  origin: string;
+  text: string;
+  sent_at: number;
+  drafted_at: number | null;
+  answered_at: number | null;
+}
+
+const toProspectMessage = (r: ProspectMessageRow): ProspectMessage => ({
+  mid: r.mid,
+  leadId: r.lead_id,
+  direction: r.direction === "in" ? "in" : "out",
+  origin: r.origin,
+  text: r.text,
+  sentAt: r.sent_at,
+  draftedAt: r.drafted_at,
+  answeredAt: r.answered_at,
+});
+
+export interface ProspectAuthorization {
+  draftId: string;
+  category: string;
+  gateReason: string;
+  expiresAt: number;
+  createdAt: number;
+}
+
+export async function getProspectThread(
+  db: D1Database,
+  leadId: string,
+): Promise<ProspectThreadDetail | null> {
+  const row = await db
+    .prepare(`SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads WHERE lead_id = ?`)
+    .bind(leadId)
+    .first<ProspectThreadDetailRow>();
+
+  return row ? toProspectThreadDetail(row) : null;
+}
+
+/**
+ * Creates or refreshes a thread from the Sheet's columns.
+ *
+ * The conflict branch only touches what the Sheet owns. Enrollment, the M1 hash
+ * and the conversation version belong to the webhook, and a Sheet resync must
+ * never roll them back.
+ */
+export async function upsertProspectThread(
+  db: D1Database,
+  t: {
+    leadId: string;
+    igUserId: string;
+    handle: string;
+    name: string | null;
+    nicho: string | null;
+  },
+): Promise<ProspectThreadDetail> {
+  const now = Date.now();
+  await db
+    .prepare(
+      `INSERT INTO prospect_threads
+         (lead_id, ig_user_id, igsid, handle, name, nicho, state, m1_sha, m1_registered_at,
+          version, last_inbound_at, last_outbound_at, created_at, updated_at)
+       VALUES (?, ?, NULL, ?, ?, ?, 'm1_pendiente', NULL, NULL, 0, NULL, NULL, ?, ?)
+       ON CONFLICT (lead_id) DO UPDATE SET
+         handle = excluded.handle,
+         name = excluded.name,
+         nicho = excluded.nicho,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(t.leadId, t.igUserId, t.handle, t.name, t.nicho, now, now)
+    .run();
+
+  const thread = await getProspectThread(db, t.leadId);
+  if (!thread) throw new Error(`prospect thread ${t.leadId} vanished after upsert`);
+  return thread;
+}
+
+/**
+ * Records the text whose echo enrolls the thread.
+ *
+ * Any earlier pending text is replaced, which is what the "M1 sin confirmar"
+ * retry does. A thread that already has an igsid is enrolled and cannot be
+ * re-armed; the caller reports that as `already_enrolled`.
+ */
+export async function registerProspectM1(
+  db: D1Database,
+  t: { leadId: string; m1Sha: string },
+): Promise<boolean> {
+  const now = Date.now();
+  const result = await db
+    .prepare(
+      `UPDATE prospect_threads
+       SET m1_sha = ?, m1_registered_at = ?, state = 'm1_pendiente', updated_at = ?
+       WHERE lead_id = ? AND igsid IS NULL AND state != 'closed'`,
+    )
+    .bind(t.m1Sha, now, now, t.leadId)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function getProspectDraft(
+  db: D1Database,
+  draftId: string,
+): Promise<ProspectDraft | null> {
+  const row = await db
+    .prepare(`SELECT * FROM prospect_drafts WHERE draft_id = ?`)
+    .bind(draftId)
+    .first<ProspectDraftRow>();
+
+  return row ? toProspectDraft(row) : null;
+}
+
+/** One row per `draft_id`; false means it was already there. */
+export async function insertProspectDraft(
+  db: D1Database,
+  d: ProspectDraft,
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT OR IGNORE INTO prospect_drafts
+         (draft_id, lead_id, kind, stage, text, base_version, status, decided_at, decided_text,
+          created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      d.draftId,
+      d.leadId,
+      d.kind,
+      d.stage,
+      d.text,
+      d.baseVersion,
+      d.status,
+      d.decidedAt,
+      d.decidedText,
+      d.createdAt,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function insertProspectAuthorization(
+  db: D1Database,
+  a: ProspectAuthorization,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO prospect_authorizations
+         (draft_id, category, gate_reason, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .bind(a.draftId, a.category, a.gateReason, a.expiresAt, a.createdAt)
+    .run();
+}
+
+/** The lead's latest message, per thread — the one a reply has to answer. */
+const LATEST_MESSAGE =
+  `(SELECT x.mid FROM prospect_messages x
+    WHERE x.lead_id = t.lead_id
+    ORDER BY x.sent_at DESC, x.mid DESC LIMIT 1)`;
+
+export interface ProspectWorkItem {
+  thread: ProspectThreadDetail;
+  /** The unanswered inbound that started the current wait. */
+  inbound: ProspectMessage;
+  /** The whole conversation, oldest first, so the draft can answer it. */
+  messages: ProspectMessage[];
+}
+
+/**
+ * Enrolled threads whose latest message is the lead's and that still need a
+ * reply, oldest wait first.
+ *
+ * "Needs a reply" means no draft for the current conversation version. A draft
+ * written before the last message is stale, and the thread comes back.
+ * `invalidated` is the one status that does not count: that draft was retired
+ * precisely because the conversation moved on.
+ */
+export async function prospectWork(
+  db: D1Database,
+  limit: number,
+): Promise<ProspectWorkItem[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT t.lead_id, t.ig_user_id, t.igsid, t.handle, t.name, t.nicho, t.state, t.m1_sha,
+              t.m1_registered_at, t.version, t.last_inbound_at, t.last_outbound_at,
+              t.created_at, t.updated_at,
+              m.mid AS inbound_mid, m.text AS inbound_text, m.sent_at AS inbound_sent_at,
+              m.origin AS inbound_origin, m.drafted_at AS inbound_drafted_at,
+              m.answered_at AS inbound_answered_at
+       FROM prospect_threads t
+       JOIN prospect_messages m ON m.mid = ${LATEST_MESSAGE}
+       WHERE t.state = 'enrolled'
+         AND m.direction = 'in'
+         AND NOT EXISTS (
+           SELECT 1 FROM prospect_drafts d
+           WHERE d.lead_id = t.lead_id AND d.base_version = t.version
+             AND d.status != 'invalidated'
+         )
+       ORDER BY m.sent_at ASC, t.lead_id ASC
+       LIMIT ?`,
+    )
+    .bind(limit)
+    .all<ProspectThreadDetailRow & {
+      inbound_mid: string;
+      inbound_text: string;
+      inbound_sent_at: number;
+      inbound_origin: string;
+      inbound_drafted_at: number | null;
+      inbound_answered_at: number | null;
+    }>();
+
+  const items = results.map((r) => ({
+    thread: toProspectThreadDetail(r),
+    inbound: toProspectMessage({
+      mid: r.inbound_mid,
+      lead_id: r.lead_id,
+      direction: "in",
+      origin: r.inbound_origin,
+      text: r.inbound_text,
+      sent_at: r.inbound_sent_at,
+      drafted_at: r.inbound_drafted_at,
+      answered_at: r.inbound_answered_at,
+    }),
+    messages: [] as ProspectMessage[],
+  }));
+
+  const byLead = new Map(items.map((i) => [i.thread.leadId, i]));
+  for (const message of await prospectMessagesFor(db, [...byLead.keys()])) {
+    byLead.get(message.leadId)?.messages.push(message);
+  }
+
+  return items;
+}
+
+/** D1 caps the bound parameters in one statement, so id lists go in chunks. */
+function chunk<T>(items: readonly T[], size = 90): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  return chunks;
+}
+
+/** Messages for a set of threads, oldest first. */
+async function prospectMessagesFor(
+  db: D1Database,
+  leadIds: readonly string[],
+): Promise<ProspectMessage[]> {
+  const messages: ProspectMessage[] = [];
+
+  for (const ids of chunk(leadIds)) {
+    const { results } = await db
+      .prepare(
+        `SELECT mid, lead_id, direction, origin, text, sent_at, drafted_at, answered_at
+         FROM prospect_messages
+         WHERE lead_id IN (${ids.map(() => "?").join(", ")})
+         ORDER BY sent_at ASC, mid ASC`,
+      )
+      .bind(...ids)
+      .all<ProspectMessageRow>();
+    messages.push(...results.map(toProspectMessage));
+  }
+
+  return messages;
+}
+
+/**
+ * Everything the Sheet and the session summary read, for threads touched since
+ * `since` (epoch ms; 0 means all).
+ *
+ * Each returned thread comes with its full message history as metadata, because
+ * an incremental poll still has to warn about a 20 h wait that started earlier.
+ * Message text is not part of the export: the board shows activity, not what
+ * anyone said.
+ */
+export async function prospectExport(
+  db: D1Database,
+  since: number,
+): Promise<{
+  threads: ProspectThreadDetail[];
+  messages: ProspectMessage[];
+  drafts: ProspectDraft[];
+}> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads
+       WHERE updated_at >= ? ORDER BY updated_at ASC, lead_id ASC`,
+    )
+    .bind(since)
+    .all<ProspectThreadDetailRow>();
+
+  const threads = results.map(toProspectThreadDetail);
+  if (threads.length === 0) return { threads, messages: [], drafts: [] };
+
+  const messages = await prospectMessagesFor(db, threads.map((t) => t.leadId));
+  const drafts: ProspectDraft[] = [];
+  for (const ids of chunk(threads.map((t) => t.leadId))) {
+    const { results: rows } = await db
+      .prepare(
+        `SELECT draft_id, lead_id, kind, stage, text, base_version, status, decided_at,
+                decided_text, created_at
+         FROM prospect_drafts
+         WHERE lead_id IN (${ids.map(() => "?").join(", ")})
+         ORDER BY created_at ASC, draft_id ASC`,
+      )
+      .bind(...ids)
+      .all<ProspectDraftRow>();
+    drafts.push(...rows.map(toProspectDraft));
+  }
+
+  return { threads, messages, drafts };
+}
+
 /* --------------------------------------------------------------- campaigns */
 
 interface CampaignRow {

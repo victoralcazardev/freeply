@@ -3,22 +3,35 @@ import { type CampaignFields, saveCampaignWithLink } from "./campaign-save";
 import * as db from "./db";
 import type { Env } from "./index";
 import { listCommentsPaged, listMediaPaged } from "./instagram";
+import { handleProspectsApi } from "./prospects-api";
 
 /**
  * Bearer-token JSON API for tooling (see README "JSON API"). Off unless the
  * API_TOKEN secret is set. No cookies, no CORS.
  */
 
-const json = (body: unknown, status = 200) =>
+export const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
 
-const fail = (status: number, error: string, detail?: string) =>
+export const fail = (status: number, error: string, detail?: string) =>
   json(detail ? { error, detail } : { error }, status);
 
-const invalid = (field: string, why: string) => fail(400, "invalid_field", `${field}: ${why}`);
+export const invalid = (field: string, why: string) =>
+  fail(400, "invalid_field", `${field}: ${why}`);
+
+/** A JSON object body, or the 400 explaining why it isn't one. */
+export async function jsonBody(request: Request): Promise<Record<string, unknown> | Response> {
+  try {
+    const parsed: unknown = await request.json();
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw 0;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return fail(400, "invalid_json");
+  }
+}
 
 const MAX_BYTES = 1000;
 const bytes = (s: string) => new TextEncoder().encode(s).length;
@@ -81,6 +94,8 @@ export async function handleApi(request: Request, env: Env, url: URL): Promise<R
     }
   }
 
+  if (path.startsWith("/api/prospects/")) return handleProspectsApi(request, env, url);
+
   return fail(404, "not_found");
 }
 
@@ -118,14 +133,9 @@ async function presentOne(env: Env, c: db.Campaign) {
 
 /** POST (existing null) and PATCH share this; PATCH only touches supplied keys. */
 async function upsert(request: Request, env: Env, existing: db.Campaign | null): Promise<Response> {
-  let body: Record<string, unknown>;
-  try {
-    const parsed: unknown = await request.json();
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw 0;
-    body = parsed as Record<string, unknown>;
-  } catch {
-    return fail(400, "invalid_json");
-  }
+  const parsed = await jsonBody(request);
+  if (parsed instanceof Response) return parsed;
+  const body = parsed;
 
   const has = (k: string) => body[k] !== undefined;
   // POST requires these; PATCH inherits them from the stored campaign.
@@ -232,7 +242,7 @@ async function upsert(request: Request, env: Env, existing: db.Campaign | null):
   return json({ campaign: await presentOne(env, saved) }, existing ? 200 : 201);
 }
 
-function limitParam(url: URL, max: number, dflt: number): number | null {
+export function limitParam(url: URL, max: number, dflt: number): number | null {
   const raw = url.searchParams.get("limit");
   if (raw === null) return dflt;
   const n = Number(raw);

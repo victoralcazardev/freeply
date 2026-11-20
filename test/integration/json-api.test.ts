@@ -180,6 +180,19 @@ describe("campaigns", () => {
     const { name: _n, ...noName } = valid;
     expect((await call("POST", "/api/campaigns", noName)).json.detail).toContain("name");
   });
+
+  // The prospects API shares the body parser with this route, so the campaign
+  // path keeps pinning that a non-object body is still 400 invalid_json.
+  it.each([
+    ["an array", []],
+    ["null", null],
+    ["a string", "just a string"],
+  ])("still rejects %s as a body", async (_label, body) => {
+    expect(await call("POST", "/api/campaigns", body)).toEqual({
+      status: 400,
+      json: { error: "invalid_json" },
+    });
+  });
 });
 
 describe("graph reads", () => {
