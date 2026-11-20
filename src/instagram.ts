@@ -191,7 +191,14 @@ export async function refreshLongLivedToken(accessToken: string): Promise<Refres
  * means they were subscribed by some other route — asserting them here stops
  * that being luck.
  */
-export const WEBHOOK_FIELDS = ["comments", "messages", "messaging_postbacks"] as const;
+export const WEBHOOK_FIELDS = [
+  "comments",
+  "messages",
+  "messaging_postbacks",
+  // Under Instagram Login the account's own sent DMs arrive on this field, not on
+  // `messages`; prospecting needs them to see that a first DM went out.
+  "message_echoes",
+] as const;
 
 /**
  * Marks an Ice Breaker payload as ours, so a tap from anything else is left alone.
