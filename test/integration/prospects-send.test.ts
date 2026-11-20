@@ -330,6 +330,21 @@ const sends = async () =>
 const account = () => env.ACCOUNT.get(env.ACCOUNT.idFromName(IG_USER_ID));
 
 /**
+ * The autopilot switch as the Durable Object sees it.
+ *
+ * An authorized (not approved) draft is an autopilot send, and the object
+ * re-reads the switch on every attempt, including the first one. Turning it on
+ * is what makes that path reach Meta at all; every other test here sends an
+ * approved draft, which the switch does not govern.
+ */
+async function setDoSwitch(value?: string): Promise<void> {
+  await runInDurableObject(account(), (instance: { env: Record<string, unknown> }) => {
+    if (value === undefined) delete instance.env.PROSPECT_AUTOPILOT;
+    else instance.env.PROSPECT_AUTOPILOT = value;
+  });
+}
+
+/**
  * Runs the alarm the way the outbox does: whatever is queued becomes due now,
  * and the Durable Object drains it. A retry that is only reachable through
  * `deliver()` is not the retry production runs.
@@ -354,6 +369,7 @@ beforeEach(async () => {
   // The Durable Object outlives a single test in this pool, so the claims it
   // took have to go with the data they referred to.
   await account().clear();
+  await setDoSwitch();
   await db.upsertAccount(env.DB, env.ENCRYPTION_KEY, {
     igUserId: IG_USER_ID,
     username: "victoralcazar",
@@ -529,6 +545,8 @@ describe("the autopilot authorization", () => {
     await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
     await pushDraft({ text: "Te cuento cómo lo hacemos." });
     await authorize("draft-1", {});
+    // The autopilot path is the only one the switch governs.
+    await setDoSwitch("on");
     stubMeta(() => ok("mid_api_auto"));
 
     expect(await account().deliver(job("draft-1"))).toBe("sent");

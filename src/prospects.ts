@@ -1,6 +1,10 @@
 import * as db from "./db";
 import type { Env } from "./index";
-import { sendProspectDraft, type ProspectSendOutcome } from "./prospects-send";
+import {
+  prospectClaimKey,
+  sendProspectDraft,
+  type ProspectSendOutcome,
+} from "./prospects-send";
 
 /**
  * What the M1 echo and the lead's replies have in common, and nothing else.
@@ -111,22 +115,61 @@ export function extractProspectEvents(payload: ProspectWebhookPayload): Prospect
  */
 export async function handleProspectEvents(
   events: readonly ProspectEvent[],
-  d1: D1Database,
+  env: Env,
 ): Promise<void> {
   for (const event of events) {
-    if (event.echo) await handleEcho(event, d1);
-    else await handleInbound(event, d1);
+    if (event.echo) await handleEcho(event, env);
+    else await handleInbound(event, env.DB);
   }
 }
 
-async function handleEcho(event: ProspectEvent, d1: D1Database): Promise<void> {
+async function handleEcho(event: ProspectEvent, env: Env): Promise<void> {
+  const d1 = env.DB;
+
   // An echo carrying a mid we stored for an API send is our own message coming
   // back: already recorded, never an owner message, and never evidence of who
   // should be enrolled. Without this, a reply whose text happened to match
   // another lead's copied M1 would register that lead with the wrong peer.
-  // T8 adds the other half — an unknown mid on an enrolled thread is the
-  // operator writing from his phone.
   if (await db.prospectMessageExists(d1, event.mid)) return;
+
+  // An echo on a thread already enrolled is the account talking to that lead:
+  // the only way a message written by hand is ever visible here. Every other
+  // echo — an unregistered peer, a friend — is dropped in memory below, with no
+  // write and no log carrying content (S11).
+  const known = await db.enrolledThreadByIgsid(d1, event.igUserId, event.peerId);
+  if (known) {
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(known.igUserId));
+
+    // The one echo that looks exactly like this and is not an owner message: the
+    // copy of our own API send, delivered before the Durable Object recorded the
+    // `message_id` it got back. T7 records it a moment later, so nothing is
+    // written now — the alternative is a duplicate message row and a version
+    // bump that invalidates drafts over a send nobody read.
+    if (await echoIsOurSend(d1, account, known, event.text)) {
+      console.log("prospect echo: in flight");
+      return;
+    }
+
+    // Read before the write: recording the owner message retires these in the
+    // same transaction, and their queued retries have to go with them.
+    const pendingDrafts = await db.pendingProspectDraftIds(d1, known.leadId);
+    const stored = await db.recordProspectOwnerMessage(d1, {
+      leadId: known.leadId,
+      igUserId: known.igUserId,
+      igsid: event.peerId,
+      mid: event.mid,
+      text: event.text,
+      sentAt: event.timestamp,
+    });
+    // A draft retired by this message must not keep a retry in the outbox: the
+    // alarm would keep coming back for a send that can no longer be right. Only
+    // the delivery that recorded the message may drop those rows — a redelivery
+    // would otherwise cancel a draft written after it, whose claim would then
+    // keep it stuck in the queue.
+    if (stored && pendingDrafts.length > 0) await account.forgetDrafts(pendingDrafts);
+    console.log("prospect echo: owner");
+    return;
+  }
 
   const sha = await prospectTextSha(event.text);
   const pending = await db.pendingM1Threads(d1, event.igUserId, sha);
@@ -157,6 +200,41 @@ async function handleEcho(event: ProspectEvent, d1: D1Database): Promise<void> {
   });
 
   if (enrolled) console.log("prospect echo: enrolled");
+}
+
+/**
+ * Whether this echo is the copy of a send we already made, whose `mid` has not
+ * reached D1 yet.
+ *
+ * Meta can deliver the echo before the API response reaches the Durable Object,
+ * so "unknown mid on an enrolled thread" is momentarily ambiguous. The evidence
+ * is that a request of ours may actually have reached Meta: a claimed draft
+ * whose request is executing or awaiting its response, or one already recorded.
+ * A claim held for a retry queued behind a definitive refusal is *not* evidence
+ * — Meta answered that one with an error — so a hand-written message that
+ * happens to match the queued text stays the operator's. Nothing here decides a
+ * send; it only keeps the owner path from claiming one that already happened.
+ */
+async function echoIsOurSend(
+  d1: D1Database,
+  account: ReturnType<Env["ACCOUNT"]["get"]>,
+  thread: db.ProspectThread,
+  text: string,
+): Promise<boolean> {
+  const inFlight = await account.prospectSendsInFlight(prospectClaimKey(thread.leadId));
+  if (inFlight.length === 0) return false;
+
+  const echo = normalizeProspectText(text);
+  for (const draftId of inFlight) {
+    const draft = await db.getProspectDraft(d1, draftId);
+    if (!draft || draft.leadId !== thread.leadId) continue;
+
+    // An approval sends `decided_text`; an authorized draft sends its own text.
+    const sent = (draft.decidedText ?? "").trim() || draft.text;
+    if (normalizeProspectText(sent) === echo) return true;
+  }
+
+  return false;
 }
 
 /** Why registering an M1 failed, as both the API and the page report it. */

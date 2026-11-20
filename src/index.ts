@@ -44,6 +44,17 @@ export interface Env {
 
   /** Bearer token for the /api/* JSON endpoints. Unset turns them off (404). */
   API_TOKEN?: string;
+
+  /**
+   * The autopilot kill switch (S6).
+   *
+   * `on` and nothing else lets the scheduled cron send an authorized reply
+   * draft on its own, without a person approving it. Unset means off, and so
+   * does any other value — a misspelt `true` must not start messaging people.
+   * It is deliberately absent from wrangler.jsonc: autonomy is switched on with
+   * a `wrangler secret`/`--var`, never as a side effect of deploying.
+   */
+  PROSPECT_AUTOPILOT?: string;
 }
 
 export { AccountDO } from "./account-do";
@@ -526,7 +537,7 @@ async function receiveEvent(
   }
   // Prospect writes run behind the 200 like every other delivery. An unknown
   // peer is dropped inside the handler, before any write or log.
-  if (prospects.length > 0) ctx.waitUntil(handleProspectEvents(prospects, env.DB));
+  if (prospects.length > 0) ctx.waitUntil(handleProspectEvents(prospects, env));
 
   for (const comment of comments) {
     console.log("comment", JSON.stringify(comment));

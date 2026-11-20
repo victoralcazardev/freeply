@@ -314,6 +314,12 @@ async function work(env: Env, url: URL): Promise<Response> {
       nicho: item.thread.nicho,
       version: item.thread.version,
       last_inbound_at: item.thread.lastInboundAt,
+      // Twenty hours is the warning line: a person still has time to answer by
+      // the API. Past twenty-four the wall is shut, and the session summary has
+      // to say "manually" rather than "soon". Both are derived from the age of
+      // the lead's message, which is what the window runs on.
+      expiring: now - item.inbound.sentAt >= db.WINDOW_WARNING_MS,
+      expired: now - item.inbound.sentAt > db.MESSAGE_WINDOW_MS,
       inbound: {
         mid: item.inbound.mid,
         text: item.inbound.text,

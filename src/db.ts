@@ -565,6 +565,65 @@ export async function recordProspectInbound(
   return (results[0]?.meta.changes ?? 0) > 0;
 }
 
+/**
+ * Stores a message the operator typed on his phone and freezes the conversation
+ * around it.
+ *
+ * An echo on an enrolled thread whose `mid` is not one of our recorded sends is
+ * the account talking to a lead we already know — the only way a message written
+ * by hand is visible to the Worker at all. Advancing the version is what tells
+ * every draft it was written against a conversation that has moved on, and the
+ * drafts are retired in the same transaction: a reply written before this
+ * message must be redrafted, not sent as if it answered it.
+ *
+ * The `NOT EXISTS` guard is by `mid`, so a redelivery writes nothing at all. It
+ * is checked before the insert below rather than after, because statements in a
+ * batch run in order.
+ */
+export async function recordProspectOwnerMessage(
+  db: D1Database,
+  t: {
+    leadId: string;
+    igUserId: string;
+    igsid: string;
+    mid: string;
+    text: string;
+    sentAt: number;
+  },
+): Promise<boolean> {
+  const now = Date.now();
+  const results = await db.batch([
+    db
+      .prepare(
+        `UPDATE prospect_threads
+         SET version = version + 1, last_outbound_at = ?, updated_at = ?
+         WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled' AND igsid = ?
+           AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)`,
+      )
+      .bind(t.sentAt, now, t.leadId, t.igUserId, t.igsid, t.mid),
+    db
+      .prepare(
+        `UPDATE prospect_drafts SET status = 'invalidated'
+         WHERE lead_id = ? AND status IN ('waiting', 'approved')
+           AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)`,
+      )
+      .bind(t.leadId, t.mid),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO prospect_messages
+           (mid, lead_id, direction, origin, text, sent_at, created_at)
+         SELECT ?, ?, 'out', 'owner', ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM prospect_threads
+           WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled' AND igsid = ?
+         )`,
+      )
+      .bind(t.mid, t.leadId, t.text, t.sentAt, now, t.leadId, t.igUserId, t.igsid),
+  ]);
+
+  return (results[0]?.meta.changes ?? 0) > 0;
+}
+
 /* ------------------------------------------------------- prospect API rows */
 
 /**
@@ -1275,6 +1334,29 @@ export async function retryProspectM1(
 }
 
 /**
+ * The drafts of a thread that could still be sent, read before they are retired.
+ *
+ * An owner message invalidates every pending draft in the same transaction, so
+ * the ids have to be collected first — they are what tells the account's outbox
+ * to drop any retry queued behind them.
+ */
+export async function pendingProspectDraftIds(
+  db: D1Database,
+  leadId: string,
+): Promise<string[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT draft_id FROM prospect_drafts
+       WHERE lead_id = ? AND status IN ('waiting', 'approved')
+       ORDER BY draft_id`,
+    )
+    .bind(leadId)
+    .all<{ draft_id: string }>();
+
+  return results.map((r) => r.draft_id);
+}
+
+/**
  * One draft decision, as the page records it.
  *
  * `from` is the status the caller believes the draft is in: an approval that
@@ -1380,6 +1462,79 @@ export async function prospectWork(
   }
 
   return items;
+}
+
+/**
+ * A reply the autopilot may send: authorized, still waiting, and in a thread the
+ * API can answer right now.
+ *
+ * The filters are what the cron may even consider, not the decision to send —
+ * the five checks still run inside the Worker for every attempt. Two of them are
+ * mirrored here on purpose: a thread outside the 24 h window, or one whose last
+ * word is ours, can never pass them, and without this the cron would re-attempt
+ * the same impossible draft every fifteen minutes for as long as the row lives.
+ * Neither filter trusts the other: `checkProspectSend` re-reads D1 either way.
+ */
+export interface ProspectAutopilotCandidate {
+  draft: ProspectDraft;
+  /** The account whose Durable Object owns this thread's claims and outbox. */
+  igUserId: string;
+  /** The thread's last outbound, for the five-minute spacing between sends. */
+  lastOutboundAt: number | null;
+  /**
+   * When the current authorization was granted — the moment the human delay
+   * runs from. A draft can be written hours before its stage graduates, and the
+   * wait that makes a send look human is the one since autonomy was given.
+   */
+  authorizedAt: number;
+}
+
+export async function prospectAutopilotCandidates(
+  db: D1Database,
+  now: number,
+  limit: number,
+): Promise<ProspectAutopilotCandidate[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT d.*, t.ig_user_id, t.last_outbound_at,
+              (SELECT a.created_at FROM prospect_authorizations a
+                WHERE a.draft_id = d.draft_id AND a.gate_reason = '' AND a.expires_at > ?
+                ORDER BY a.expires_at DESC, a.created_at DESC LIMIT 1) AS authorized_at
+       FROM prospect_drafts d
+       JOIN prospect_threads t ON t.lead_id = d.lead_id
+       WHERE d.kind = 'reply' AND d.status = 'waiting' AND t.state = 'enrolled'
+         AND t.last_inbound_at IS NOT NULL AND t.last_inbound_at > ?
+         AND (SELECT x.direction FROM prospect_messages x
+              WHERE x.lead_id = d.lead_id
+              ORDER BY x.sent_at DESC, x.mid DESC LIMIT 1) = 'in'
+         AND EXISTS (
+           SELECT 1 FROM prospect_authorizations a
+           WHERE a.draft_id = d.draft_id AND a.gate_reason = '' AND a.expires_at > ?)
+       ORDER BY d.created_at ASC, d.draft_id ASC
+       LIMIT ?`,
+    )
+    .bind(
+      now,
+      now - MESSAGE_WINDOW_MS,
+      now,
+      limit,
+    )
+    .all<
+      ProspectDraftRow & {
+        ig_user_id: string;
+        last_outbound_at: number | null;
+        authorized_at: number | null;
+      }
+    >();
+
+  return results.map((r) => ({
+    draft: toProspectDraft(r),
+    igUserId: r.ig_user_id,
+    lastOutboundAt: r.last_outbound_at,
+    // The EXISTS above guarantees a row; the column is the same read, kept
+    // nullable only because a correlated subquery is typed that way.
+    authorizedAt: r.authorized_at ?? r.created_at,
+  }));
 }
 
 /** D1 caps the bound parameters in one statement, so id lists go in chunks. */

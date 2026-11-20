@@ -1,7 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import * as db from "./db";
 import { replyToComment, sendMessage, sendPrivateReply, type SendResult } from "./instagram";
-import { blockProspectSend, checkProspectSend, setProspectDraftStatus } from "./prospects-send";
+import {
+  PROSPECT_CAMPAIGN_ID,
+  blockProspectSend,
+  checkProspectSend,
+  prospectAutopilotOn,
+  setProspectDraftStatus,
+} from "./prospects-send";
 
 const PRUNE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -67,6 +73,12 @@ export interface SendJob {
 interface SendEnv {
   DB: D1Database;
   ENCRYPTION_KEY: string;
+  /**
+   * The autopilot kill switch. Read again on every attempt, including the
+   * retries this object makes on its own alarm: autonomy can be withdrawn
+   * between the run that queued a draft and the moment it would be sent.
+   */
+  PROSPECT_AUTOPILOT?: string;
 }
 
 type OutboxRow = { job: string; attempts: number };
@@ -178,6 +190,76 @@ export class AccountDO extends DurableObject<SendEnv> {
     const before = this.count();
     this.ctx.storage.sql.exec(`DELETE FROM seen`);
     return before;
+  }
+
+  /**
+   * The drafts claimed under one key whose claim is still held.
+   *
+   * A prospect send takes its claim before the API call and releases it only
+   * when nothing was sent, so this is the set of sends that are in flight or
+   * have already gone out. The webhook reads it to recognise the echo of an API
+   * send whose `message_id` has not reached D1 yet, instead of storing it as a
+   * message the operator typed on his phone.
+   */
+  claimedDrafts(threadKey: string): string[] {
+    return this.ctx.storage.sql
+      .exec<{ commenter_id: string }>(
+        `SELECT commenter_id FROM seen WHERE campaign_key = ? ORDER BY sent_at DESC`,
+        threadKey,
+      )
+      .toArray()
+      .map((r) => r.commenter_id);
+  }
+
+  /**
+   * Drafts of one prospect thread whose API request may have reached Meta.
+   *
+   * A held claim alone is not that. After a definitive refusal — a 429, a 5xx —
+   * the claim is deliberately kept while the retry waits in the outbox, and the
+   * webhook must not read that as "our message is on its way": the operator may
+   * have written that exact text by hand meanwhile. Only a claimed draft with no
+   * outbox row (the request is executing, awaiting its response, or already
+   * recorded) or one whose retry is due now can be the source of an echo.
+   */
+  prospectSendsInFlight(threadKey: string): string[] {
+    const claimed = this.claimedDrafts(threadKey);
+    if (claimed.length === 0) return [];
+
+    const now = Date.now();
+    const queued = new Map<string, number>();
+    for (const row of this.ctx.storage.sql
+      .exec<{ comment_id: string; due_at: number }>(
+        `SELECT comment_id, due_at FROM outbox WHERE campaign_id = ?`,
+        PROSPECT_CAMPAIGN_ID,
+      )
+      .toArray()) {
+      queued.set(row.comment_id, row.due_at);
+    }
+
+    return claimed.filter((draftId) => {
+      const dueAt = queued.get(draftId);
+      return dueAt === undefined || dueAt <= now;
+    });
+  }
+
+  /**
+   * Drops the queued retry of drafts that can no longer be sent.
+   *
+   * An owner message retires the drafts written before it; a retry that outlived
+   * them would still be drained by the alarm, be refused by the checks, and keep
+   * the alarm rescheduling work that cannot happen. The claim stays — nothing
+   * about these drafts may send again — but the work behind them goes.
+   */
+  forgetDrafts(draftIds: readonly string[]): number {
+    let dropped = 0;
+    for (const draftId of draftIds) {
+      dropped += this.ctx.storage.sql.exec(
+        `DELETE FROM outbox WHERE campaign_id = ? AND comment_id = ?`,
+        PROSPECT_CAMPAIGN_ID,
+        draftId,
+      ).rowsWritten;
+    }
+    return dropped;
   }
 
   /** Test/debug helper: how many commenters are currently claimed. */
@@ -302,6 +384,18 @@ export class AccountDO extends DurableObject<SendEnv> {
       await blockProspectSend(this.env.DB, draftId, check.code);
       console.error(`prospect reply blocked (${check.code})`);
       return `blocked:${check.code}`;
+    }
+
+    // Autonomy can be withdrawn between the run that queued this attempt and the
+    // alarm that makes it, and this is the only place every attempt passes
+    // through. A person's approval is not affected: that is a decision, not a
+    // gate. Nothing is sent, the draft stays waiting for a person, and the retry
+    // is settled so the alarm stops coming back for it while the switch is off.
+    if (check.autopilot && !prospectAutopilotOn(this.env)) {
+      this.release(job.dedupeKey, job.commenterId);
+      this.forget(job);
+      console.error("prospect autopilot: switch is not on — attempt stopped");
+      return "blocked:no_approval";
     }
 
     const token = await db.getAccountToken(this.env.DB, this.env.ENCRYPTION_KEY, job.igUserId);

@@ -11,6 +11,12 @@
 import * as db from "./db";
 import { type CommentEvent, type Env, handleComment, matchesKeyword } from "./index";
 import { listRecentComments, listRecentMedia, refreshLongLivedToken } from "./instagram";
+import {
+  blockProspectSend,
+  prospectAutopilotOn,
+  prospectClaimKey,
+  sendProspectDraft,
+} from "./prospects-send";
 
 const DAY_MS = 86_400_000;
 
@@ -52,8 +58,14 @@ const MAX_ACCOUNTS_PER_RUN = 5;
 const MAX_RECOVERY_FAILURES = 3;
 
 export async function scheduled(controller: ScheduledController, env: Env): Promise<void> {
-  if (controller.cron === TOKEN_REFRESH_CRON) await refreshTokens(env);
-  else await reconcile(env);
+  if (controller.cron === TOKEN_REFRESH_CRON) {
+    await refreshTokens(env);
+    return;
+  }
+  await reconcile(env);
+  // The same every-fifteen-minutes trigger carries the autopilot: a reply the
+  // CLI authorized, sent with a human-looking delay (S6).
+  await prospectAutopilot(env);
 }
 
 /* --------------------------------------------------------------- refresh */
@@ -237,4 +249,161 @@ async function mediaToPoll(campaigns: db.Campaign[], token: string): Promise<str
   const recent = accountWide ? await listRecentMedia(token, MAX_MEDIA_PER_RUN) : [];
 
   return [...new Set([...pinned, ...recent])].slice(0, MAX_MEDIA_PER_RUN);
+}
+
+/* ------------------------------------------------------ prospect autopilot */
+
+/**
+ * The one job that messages a person with nobody in the loop (S6).
+ *
+ * It decides *which* drafts to offer the send path and nothing else: every send
+ * goes through `sendProspectDraft`, so the five checks of § Transporte run
+ * inside the Worker immediately before each attempt. A draft is only offered
+ * when the CLI left a current authorization with an empty gate reason, which is
+ * the CLI's verdict on the stage — the Worker never decides what may be said.
+ */
+
+/** The shortest and the longest a draft waits before the autopilot may send it. */
+export const PROSPECT_AUTOPILOT_MIN_DELAY_MS = 3 * 60_000;
+export const PROSPECT_AUTOPILOT_MAX_DELAY_MS = 12 * 60_000;
+
+/** Sends per run. A pass every fifteen minutes still leaves the account unhurried. */
+export const PROSPECT_AUTOPILOT_PER_RUN = 5;
+
+/** Never two messages into the same conversation closer together than this. */
+export const PROSPECT_AUTOPILOT_SPACING_MS = 5 * 60_000;
+
+/**
+ * When a draft becomes due, between three and twelve minutes after the CLI
+ * authorized it.
+ *
+ * The delay runs from the authorization, not from when the draft was written: a
+ * draft can sit in D1 for hours while its stage waits to graduate, and starting
+ * the clock when the text was written would send the moment the gate opens —
+ * which is exactly the non-human timing the delay exists to avoid. Derived from
+ * the draft id instead of stored: the schema has no `due_at` column, and a hash
+ * gives each draft its own delay that does not change between runs. A random
+ * offset would push the same draft back on every pass and, at a run every
+ * fifteen minutes, could keep it from being sent at all.
+ */
+export function prospectAutopilotDueAt(d: { draftId: string; authorizedAt: number }): number {
+  let hash = 0x811c9dc5; // FNV-1a: stable across runs and spread across ids.
+  for (let i = 0; i < d.draftId.length; i++) {
+    hash = Math.imul(hash ^ d.draftId.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  const spread = PROSPECT_AUTOPILOT_MAX_DELAY_MS - PROSPECT_AUTOPILOT_MIN_DELAY_MS;
+  return d.authorizedAt + PROSPECT_AUTOPILOT_MIN_DELAY_MS + (hash % (spread + 1));
+}
+
+/** What one pass did, so a test — or a log line — can tell the cases apart. */
+export interface ProspectAutopilotRun {
+  /** Whether the switch let the run look at anything at all. */
+  enabled: boolean;
+  /** Drafts handed to the send path: the number the per-run cap counts. */
+  attempted: number;
+  sent: number;
+  queued: number;
+  failed: number;
+  unknown: number;
+  blocked: number;
+}
+
+export async function prospectAutopilot(
+  env: Env,
+  now = Date.now(),
+): Promise<ProspectAutopilotRun> {
+  const run: ProspectAutopilotRun = {
+    enabled: false,
+    attempted: 0,
+    sent: 0,
+    queued: 0,
+    failed: 0,
+    unknown: 0,
+    blocked: 0,
+  };
+
+  // The switch, first thing: without it the cron does not even read what it
+  // could have sent. Nothing below is reachable with autonomy off.
+  if (!prospectAutopilotOn(env)) return run;
+  run.enabled = true;
+
+  // More candidates than the cap, so a few threads still inside their five
+  // minutes of spacing do not keep older sendable drafts out of the pass.
+  const candidates = await db.prospectAutopilotCandidates(
+    env.DB,
+    now,
+    PROSPECT_AUTOPILOT_PER_RUN * 5,
+  );
+
+  const sentThreads = new Set<string>();
+  // Claims and outbox rows are the Durable Object's, so they are read per
+  // thread and remembered for this pass only.
+  const claimsByThread = new Map<string, string[]>();
+  const claimsOf = async (igUserId: string, leadId: string): Promise<string[]> => {
+    const key = `${igUserId}\u0000${leadId}`;
+    let claimed = claimsByThread.get(key);
+    if (claimed === undefined) {
+      const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(igUserId));
+      claimed = await account.claimedDrafts(prospectClaimKey(leadId));
+      claimsByThread.set(key, claimed);
+    }
+    return claimed;
+  };
+
+  for (const candidate of candidates) {
+    if (run.attempted >= PROSPECT_AUTOPILOT_PER_RUN) break;
+    // The switch again, right before each send: this is the only place a DM
+    // leaves without a person deciding it, so it is re-read per message.
+    if (!prospectAutopilotOn(env)) break;
+
+    const { draft } = candidate;
+    const dueAt = prospectAutopilotDueAt({
+      draftId: draft.draftId,
+      authorizedAt: candidate.authorizedAt,
+    });
+    if (dueAt > now) continue;
+    if (sentThreads.has(draft.leadId)) continue;
+    // A held claim means this draft is already in flight, or its retry is queued
+    // behind a refusal. Neither is ours to send: the claim belongs to that send,
+    // and reading it as "already sent" would retire a draft that never left.
+    if ((await claimsOf(candidate.igUserId, draft.leadId)).includes(draft.draftId)) continue;
+    if (
+      candidate.lastOutboundAt !== null &&
+      now - candidate.lastOutboundAt < PROSPECT_AUTOPILOT_SPACING_MS
+    ) {
+      continue;
+    }
+
+    sentThreads.add(draft.leadId);
+    const outcome = await sendProspectDraft(env, {
+      draftId: draft.draftId,
+      leadId: draft.leadId,
+      text: draft.text,
+    });
+
+    if (outcome.status === "blocked") {
+      // Nothing was sent, so the slot was not spent and the rest of the pass
+      // goes on. The DO records the reason on its own checks; this covers the
+      // refusal it never saw (a thread closed, or a draft no longer waiting).
+      run.blocked++;
+      await blockProspectSend(env.DB, draft.draftId, outcome.code, now);
+      continue;
+    }
+
+    run.attempted++;
+    if (outcome.status === "sent") run.sent++;
+    else if (outcome.status === "queued") run.queued++;
+    else if (outcome.status === "send_state_unknown") run.unknown++;
+    else run.failed++;
+  }
+
+  if (run.attempted > 0 || run.blocked > 0) {
+    // Counts only: the draft ids and the conversations stay out of the log.
+    console.log(
+      `prospect autopilot: sent=${run.sent} queued=${run.queued} ` +
+        `failed=${run.failed} unknown=${run.unknown} blocked=${run.blocked}`,
+    );
+  }
+
+  return run;
 }

@@ -17,6 +17,22 @@ import type { Env } from "./index";
  * refusal has its own stable code so the page can say which one it was.
  */
 
+/**
+ * The autopilot kill switch (S6).
+ *
+ * Only the exact literal `on` means yes. Unset, `off` and anything else — a
+ * padded `" on"`, a `true`, a UI toggle that wrote `On` — all mean no, because
+ * this is the one decision that lets a message reach a person with nobody in the
+ * loop. Both the cron and the account's Durable Object read it through here, so
+ * there is one answer to what counts as autonomy.
+ */
+export function prospectAutopilotOn(env: { PROSPECT_AUTOPILOT?: string }): boolean {
+  return env.PROSPECT_AUTOPILOT === "on";
+}
+
+/** The outbox's campaign id for prospect sends; the row is not a real campaign. */
+export const PROSPECT_CAMPAIGN_ID = "prospect";
+
 /** Why a prospect reply may not be sent. The strings are contract, not copy. */
 export type ProspectBlockCode =
   | "not_registered"
@@ -63,6 +79,12 @@ export type ProspectCheck =
       text: string;
       /** The lead's message this reply answers. */
       inboundMid: string;
+      /**
+       * The permission is an autopilot authorization, not a person's approval.
+       * The send path uses this to require the switch on every attempt, and the
+       * Durable Object reads it again for each retry the alarm makes.
+       */
+      autopilot: boolean;
     }
   | { ok: false; code: ProspectBlockCode };
 
@@ -144,7 +166,20 @@ export async function checkProspectSend(
     recipientId: thread.igsid,
     text: approved ? (draft.decidedText ?? "").trim() : draft.text,
     inboundMid: latest.mid,
+    autopilot: !approved,
   };
+}
+
+/**
+ * The claim the account's Durable Object holds for a prospect thread.
+ *
+ * One per conversation, so the claims of a thread are exactly the sends it has
+ * in flight — which is what the webhook reads to tell the echo of our own API
+ * send, whose `mid` may still be on its way back, from a message the operator
+ * typed on his phone (see `handleEcho` in `src/prospects.ts`).
+ */
+export function prospectClaimKey(leadId: string): string {
+  return `prospect:${leadId}`;
 }
 
 /**
@@ -164,9 +199,9 @@ function prospectReplyJob(t: {
 }): SendJob {
   return {
     igUserId: t.igUserId,
-    campaignId: "prospect",
+    campaignId: PROSPECT_CAMPAIGN_ID,
     kind: "prospect_reply",
-    dedupeKey: `prospect:${t.leadId}`,
+    dedupeKey: prospectClaimKey(t.leadId),
     commentId: t.draftId,
     commenterId: t.draftId,
     draftId: t.draftId,
@@ -211,10 +246,20 @@ export async function sendProspectDraft(
   });
   const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(thread.igUserId));
 
-  if (!(await account.claim(job.dedupeKey, job.commenterId))) {
-    // The DO half of check 5: this draft is already in flight, or it already
-    // went out and its claim is still held.
+  // Check 5's evidence is the stored message, never a claim. A claim is also
+  // held by a retry queued behind a refusal (a 429), and reading that as "this
+  // draft already went out" would retire a draft that has not left at all. The
+  // draft is settled through the same writer as every other refusal.
+  if (await db.prospectMessageByIdem(env.DB, t.leadId, t.draftId)) {
+    await blockProspectSend(env.DB, t.draftId, "already_sent");
     return { status: "blocked", code: "already_sent" };
+  }
+
+  if (!(await account.claim(job.dedupeKey, job.commenterId))) {
+    // The draft is already being sent, or its retry is waiting in the outbox.
+    // Either way this request sends nothing and the draft keeps the state it
+    // has: it is not "sent", and the queue behind it is not touched.
+    return { status: "queued" };
   }
 
   return outcome(await account.deliver(job));

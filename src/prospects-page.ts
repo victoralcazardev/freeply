@@ -131,12 +131,18 @@ async function render(
   extra: { copied?: CopiedM1; status?: string; error?: string },
 ): Promise<Response> {
   const now = Date.now();
-  const [m1, drafts, manual] = await Promise.all([
+  const [m1, drafts, manual, work] = await Promise.all([
     db.prospectM1Queue(env.DB, now),
     db.prospectDraftQueue(env.DB, now),
     db.prospectManualQueue(env.DB, now),
+    db.prospectWork(env.DB, OVERDUE_LIMIT),
   ]);
   const copied = extra.copied ?? null;
+  // A lead who wrote and has no draft yet is the CLI's work — until the wait
+  // gets long enough that a person has to watch it. From twenty hours it shows
+  // in Manual as a warning, and past twenty-four as something only the app can
+  // answer, because the API wall has already come down.
+  const overdue = work.filter((item) => now - item.inbound.sentAt >= db.WINDOW_WARNING_MS);
 
   return prospectsPage({
     host: url.host,
@@ -147,6 +153,7 @@ async function render(
     unconfirmed: m1.unconfirmed,
     drafts,
     manual,
+    overdue,
     copied,
     status: extra.status ?? url.searchParams.get("status") ?? undefined,
     error: extra.error ?? url.searchParams.get("error") ?? undefined,
@@ -228,6 +235,8 @@ export interface ProspectsPageData {
   unconfirmed: db.ProspectM1Item[];
   drafts: db.ProspectQueueItem[];
   manual: db.ProspectManualItem[];
+  /** Unanswered inbounds with no draft yet, past the 20 h warning line. */
+  overdue: db.ProspectWorkItem[];
   copied: CopiedM1 | null;
   status?: string;
   error?: string;
@@ -273,15 +282,19 @@ export function prospectsPage(d: ProspectsPageData): Response {
       </section>
 
       <section id="manual" class="queue">
-        <h2>Manual <span class="small muted">${d.manual.length}</span></h2>
+        <h2>Manual <span class="small muted">${d.manual.length + d.overdue.length}</span></h2>
+        ${d.overdue.map((item) => overdueCard(item, d.now)).join("")}
         ${
-          d.manual.length === 0
+          d.manual.length === 0 && d.overdue.length === 0
             ? empty("Nada para enviar a mano.")
             : d.manual.map((item) => manualCard(item, d.now)).join("")
         }
       </section>`,
   });
 }
+
+/** How many undrafted threads the page looks at; a phone shows a session's worth. */
+const OVERDUE_LIMIT = 25;
 
 const empty = (text: string) => `<div class="card muted">${esc(text)}</div>`;
 
@@ -364,7 +377,9 @@ function draftCard(item: db.ProspectQueueItem, now: number, i: number): string {
       <h3>${title(thread.name, thread.handle)}</h3>
       ${
         thread.lastInboundAt !== null
-          ? `<span class="tag ${closing ? "warn" : ""}">${windowLeft(now, thread.lastInboundAt)}</span>`
+          ? `<span class="tag ${closing ? "warn" : ""}">${
+              closing ? "A punto de caducar · " : "" // the 20 h highlight
+            }${windowLeft(now, thread.lastInboundAt)}</span>`
           : ""
       }
     </div>
@@ -384,6 +399,36 @@ function draftCard(item: db.ProspectQueueItem, now: number, i: number): string {
     <p class="small muted">Aprobar envía el texto final desde el Worker. Si no puede, la página
       dice por qué. A las 24 h del último mensaje del lead la ventana se cierra y ya no se
       puede contestar.</p>
+  </div>`;
+}
+
+/**
+ * A wait with no draft behind it: either the CLI has not answered yet or it is
+ * not running, and the 24 h wall is the thing that decides who answers it.
+ */
+function overdueCard(item: db.ProspectWorkItem, now: number): string {
+  const { thread, inbound } = item;
+  const waited = now - inbound.sentAt;
+  const expired = waited > db.MESSAGE_WINDOW_MS;
+
+  return `<div class="card">
+    <div class="row">
+      <h3>${title(thread.name, thread.handle)}</h3>
+      <span class="tag warn">${expired ? "Fuera de ventana" : "A punto de caducar"}</span>
+    </div>
+    <p class="small muted" style="margin:.15rem 0 .5rem">@${esc(thread.handle)} · el lead
+      escribió hace ${ago(waited)}</p>
+    <p class="small">«${esc(inbound.text)}»</p>
+    <p class="small">${
+      expired
+        ? "La API ya no puede contestar a este mensaje: háblalo desde Instagram."
+        : "Todavía se puede contestar por la API, pero queda poco: si no llega un borrador, contéstale desde Instagram."
+    }</p>
+    <div class="actions">
+      <a href="${esc(chatUrl(thread.handle))}" target="_blank" rel="noopener">
+        <button type="button">Abrir chat</button>
+      </a>
+    </div>
   </div>`;
 }
 
