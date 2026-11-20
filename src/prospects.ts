@@ -1,4 +1,6 @@
 import * as db from "./db";
+import type { Env } from "./index";
+import { sendProspectDraft, type ProspectSendOutcome } from "./prospects-send";
 
 /**
  * What the M1 echo and the lead's replies have in common, and nothing else.
@@ -118,6 +120,14 @@ export async function handleProspectEvents(
 }
 
 async function handleEcho(event: ProspectEvent, d1: D1Database): Promise<void> {
+  // An echo carrying a mid we stored for an API send is our own message coming
+  // back: already recorded, never an owner message, and never evidence of who
+  // should be enrolled. Without this, a reply whose text happened to match
+  // another lead's copied M1 would register that lead with the wrong peer.
+  // T8 adds the other half — an unknown mid on an enrolled thread is the
+  // operator writing from his phone.
+  if (await db.prospectMessageExists(d1, event.mid)) return;
+
   const sha = await prospectTextSha(event.text);
   const pending = await db.pendingM1Threads(d1, event.igUserId, sha);
 
@@ -185,7 +195,7 @@ export async function registerExpectedM1(
 
 /** Why approving a draft failed, as the page reports it. */
 export type DraftApproval =
-  | { ok: true; draft: db.ProspectDraft }
+  | { ok: true; send: ProspectSendOutcome }
   | {
       ok: false;
       error: "not_found" | "not_waiting" | "not_a_reply" | "empty_text";
@@ -193,17 +203,20 @@ export type DraftApproval =
 
 /**
  * Records the operator's approval of a reply draft — the OK that used to be a
- * Telegram message.
+ * Telegram message — and sends it in the same request.
  *
  * The approved text is stored in `decided_text`, which is also what the
  * graduation count reads: a draft sent as written graduates its stage, an edited
- * one does not. Sending is T7's job and hooks in at the marked line.
+ * one does not. That write is check 4's evidence: the send path finds an
+ * `approved` draft carrying this exact text, and re-reads it before every
+ * attempt. A draft that never passed through here needs a current autopilot
+ * authorization instead, and has none until the CLI writes one.
  */
 export async function approveProspectDraft(
-  d1: D1Database,
+  env: Env,
   d: { draftId: string; text: string; now?: number },
 ): Promise<DraftApproval> {
-  const draft = await db.getProspectDraft(d1, d.draftId);
+  const draft = await db.getProspectDraft(env.DB, d.draftId);
   if (!draft) return { ok: false, error: "not_found" };
   if (draft.kind !== "reply") return { ok: false, error: "not_a_reply" };
   if (draft.status !== "waiting") return { ok: false, error: "not_waiting" };
@@ -212,7 +225,7 @@ export async function approveProspectDraft(
   if (!decidedText) return { ok: false, error: "empty_text" };
 
   const now = d.now ?? Date.now();
-  const decided = await db.decideProspectDraft(d1, {
+  const decided = await db.decideProspectDraft(env.DB, {
     draftId: d.draftId,
     from: ["waiting"],
     status: "approved",
@@ -222,13 +235,12 @@ export async function approveProspectDraft(
   // Somebody else decided it between the read and this write.
   if (!decided) return { ok: false, error: "not_waiting" };
 
-  // T7 sends from here: `sendApprovedDraft(d1, { draft, decidedText })`, whose
-  // five checks read the row this call just wrote. Nothing leaves the Worker
-  // before that line exists.
-  return {
-    ok: true,
-    draft: { ...draft, status: "approved", decidedText, decidedAt: now },
-  };
+  const send = await sendProspectDraft(env, {
+    draftId: d.draftId,
+    leadId: draft.leadId,
+    text: decidedText,
+  });
+  return { ok: true, send };
 }
 
 async function handleInbound(event: ProspectEvent, d1: D1Database): Promise<void> {

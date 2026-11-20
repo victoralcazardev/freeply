@@ -1,5 +1,5 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSession, sessionCookie } from "../../src/auth";
 import * as db from "../../src/db";
 import worker from "../../src/index";
@@ -605,7 +605,9 @@ describe("POST /prospects/m1/retry", () => {
 });
 
 describe("POST /prospects/drafts", () => {
-  it("records the approval with the text the operator left, and sends nothing", async () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("records the approval with the text the operator left, and sends it", async () => {
     const now = Date.now();
     const enrolled = await enrolledLead({
       leadId: "lead-1",
@@ -617,6 +619,14 @@ describe("POST /prospects/drafts", () => {
     await pushDraft({ draftId: "draft-1", leadId: "lead-1", text: "Gracias por responder." });
     const messages = await messageCount();
     const edited = "Gracias por responder, Ana. ¿Lo vemos el jueves?";
+    let sent: any = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        sent = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify({ message_id: "mid_api_1" }), { status: 200 });
+      }),
+    );
 
     const response = await postPage("/prospects/drafts", {
       draft_id: "draft-1",
@@ -624,14 +634,16 @@ describe("POST /prospects/drafts", () => {
       text: edited,
     });
     expect(response.status).toBe(302);
-    expect(response.location).toContain("/prospects");
+    expect(decodeURIComponent(response.location ?? "")).toContain("enviado");
 
+    // Approving is the send (T7): the operator's text is what reaches the lead.
+    expect(sent.message).toEqual({ text: edited });
     const draft = await draftRow("draft-1");
-    expect(draft.status).toBe("approved");
+    expect(draft.status).toBe("sent");
     expect(draft.decided_text).toBe(edited);
     expect(draft.decided_at).toBeGreaterThan(0);
-    // Approval is not a send: T7 owns that, and nothing left the Worker here.
-    expect(await messageCount()).toBe(messages);
+    expect(await messageCount()).toBe(messages + 1);
+    // A prospect send is logged in its conversation, never in `sends`.
     const sends = await env.DB.prepare(`SELECT COUNT(*) AS n FROM sends`).first<{ n: number }>();
     expect(sends?.n).toBe(0);
   });

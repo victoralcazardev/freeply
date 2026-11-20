@@ -2,6 +2,7 @@ import { chrome, esc } from "./dashboard";
 import * as db from "./db";
 import type { Env } from "./index";
 import { approveProspectDraft, registerExpectedM1 } from "./prospects";
+import type { ProspectBlockCode, ProspectSendOutcome } from "./prospects-send";
 
 /**
  * The mobile page for the daily sessions (S8): four queues over the threads the
@@ -42,6 +43,37 @@ const APPROVE_ERRORS = {
   not_a_reply: "Solo se aprueban respuestas, no el M1.",
   empty_text: "El texto está vacío.",
 } as const;
+
+/** The two approvals that leave nothing for a person to do. */
+const SEND_DONE: Record<"sent" | "queued", string> = {
+  sent: "Aprobado y enviado.",
+  queued: "Aprobado. Meta ha dado un error temporal: el envío se reintenta solo.",
+};
+
+/**
+ * Why an approval could not send, in the operator's language and with the code
+ * the checks returned — the code is what he can quote when one of these is
+ * wrong, and each one points at a different thing to do next.
+ */
+const SEND_BLOCKED: Record<ProspectBlockCode, string> = {
+  not_registered:
+    "Este hilo ya no está registrado (not_registered): no se puede enviar por la API.",
+  window_closed:
+    "La ventana de 24 h está cerrada o el último mensaje no es del lead (window_closed): " +
+    "contéstale a mano desde Instagram.",
+  version_changed:
+    "La conversación cambió desde que se redactó (version_changed): el borrador queda " +
+    "invalidado y hay que redactarlo otra vez.",
+  no_approval: "Este borrador no tiene una aprobación válida (no_approval).",
+  already_sent: "Este borrador ya se envió (already_sent): no se manda dos veces.",
+};
+
+const SEND_UNKNOWN =
+  "No sabemos si salió (send_state_unknown): un corte a media llamada no dice si llegó. " +
+  "Está en la cola Manual — mira el hilo en Instagram y contesta «Salió» o «No salió».";
+
+const SEND_FAILED =
+  "No se envió y el borrador vuelve a la cola (failed): revisa el texto y vuelve a aprobarlo.";
 
 /** What the non-approval buttons do, and which statuses they may act on. */
 const DECISIONS: Record<
@@ -137,6 +169,16 @@ async function copyM1(env: Env, url: URL, leadId: string, text: string): Promise
   });
 }
 
+/** What the page says after an approval, by what the send came back with. */
+function sendSaid(send: ProspectSendOutcome): Response {
+  if (send.status === "sent" || send.status === "queued") {
+    return redirect(`/prospects?status=${encodeURIComponent(SEND_DONE[send.status])}`);
+  }
+  if (send.status === "blocked") return problem(SEND_BLOCKED[send.code]);
+  if (send.status === "send_state_unknown") return problem(SEND_UNKNOWN);
+  return problem(SEND_FAILED);
+}
+
 /** "Reintentar": back to the send queue with nothing registered. */
 async function retryM1(env: Env, leadId: string): Promise<Response> {
   const retried = leadId !== "" && (await db.retryProspectM1(env.DB, leadId));
@@ -155,10 +197,11 @@ async function decideDraft(
   const now = Date.now();
 
   if (action === "approve") {
-    const result = await approveProspectDraft(env.DB, { draftId, text, now });
+    // Approval and send are one gesture: the answer to this POST is whether the
+    // DM left, and if it did not, which check stopped it.
+    const result = await approveProspectDraft(env, { draftId, text, now });
     if (!result.ok) return problem(APPROVE_ERRORS[result.error]);
-    // No send here: T7 hooks the send into `approveProspectDraft`.
-    return redirect(`/prospects?status=${encodeURIComponent("Aprobado y guardado.")}`);
+    return sendSaid(result.send);
   }
 
   const decision = DECISIONS[action];
@@ -338,8 +381,9 @@ function draftCard(item: db.ProspectQueueItem, now: number, i: number): string {
         <button name="action" value="skip">Omitir</button>
       </div>
     </form>
-    <p class="small muted">Aprobar guarda el texto final; el envío sale desde el Worker.
-      A las 24 h del último mensaje del lead la ventana se cierra y ya no se puede contestar.</p>
+    <p class="small muted">Aprobar envía el texto final desde el Worker. Si no puede, la página
+      dice por qué. A las 24 h del último mensaje del lead la ventana se cierra y ya no se
+      puede contestar.</p>
   </div>`;
 }
 

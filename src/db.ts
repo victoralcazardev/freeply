@@ -844,6 +844,158 @@ export async function insertProspectAuthorization(
     .run();
 }
 
+interface ProspectAuthorizationRow {
+  draft_id: string;
+  category: string;
+  gate_reason: string;
+  expires_at: number;
+  created_at: number;
+}
+
+/**
+ * The autopilot permission that covers this draft right now, if any.
+ *
+ * A row whose gate refused (a non-empty `gate_reason`) is not permission: the
+ * CLI records what the gate answered, and the Worker obeys it either way. The
+ * newest still-valid row wins, so re-authorizing extends rather than conflicts.
+ */
+export async function currentProspectAuthorization(
+  db: D1Database,
+  draftId: string,
+  now = Date.now(),
+): Promise<ProspectAuthorization | null> {
+  const row = await db
+    .prepare(
+      `SELECT draft_id, category, gate_reason, expires_at, created_at
+       FROM prospect_authorizations
+       WHERE draft_id = ? AND gate_reason = '' AND expires_at > ?
+       ORDER BY expires_at DESC LIMIT 1`,
+    )
+    .bind(draftId, now)
+    .first<ProspectAuthorizationRow>();
+
+  return row
+    ? {
+        draftId: row.draft_id,
+        category: row.category,
+        gateReason: row.gate_reason,
+        expiresAt: row.expires_at,
+        createdAt: row.created_at,
+      }
+    : null;
+}
+
+/* ------------------------------------------------------- prospect sending */
+
+/**
+ * The thread's last message in either direction — whose turn it is.
+ *
+ * An API reply only makes sense while the lead has the last word: answering our
+ * own last message is not a reply, and Meta refuses it anyway.
+ */
+export async function latestProspectMessage(
+  db: D1Database,
+  leadId: string,
+): Promise<ProspectMessage | null> {
+  const row = await db
+    .prepare(
+      `SELECT mid, lead_id, direction, origin, text, sent_at, drafted_at, answered_at
+       FROM prospect_messages WHERE lead_id = ?
+       ORDER BY sent_at DESC, mid DESC LIMIT 1`,
+    )
+    .bind(leadId)
+    .first<ProspectMessageRow>();
+
+  return row ? toProspectMessage(row) : null;
+}
+
+/**
+ * Whether this idempotency key is already spent on this thread.
+ *
+ * `idem` is our own key for an API send — the draft id — and the unique index on
+ * `(lead_id, idem)` makes it binding even if two writers race.
+ */
+export async function prospectMessageByIdem(
+  db: D1Database,
+  leadId: string,
+  idem: string,
+): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT 1 AS found FROM prospect_messages WHERE lead_id = ? AND idem = ?`)
+    .bind(leadId, idem)
+    .first<{ found: number }>();
+
+  return row !== null;
+}
+
+/** Whether Meta's id for this message is already stored. */
+export async function prospectMessageExists(db: D1Database, mid: string): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT 1 AS found FROM prospect_messages WHERE mid = ?`)
+    .bind(mid)
+    .first<{ found: number }>();
+
+  return row !== null;
+}
+
+/**
+ * Stores a confirmed API reply and settles the conversation around it.
+ *
+ * The writes belong together: the message itself, the version it moves, the
+ * inbound it answers, and the draft it came from. The message keeps the `mid`
+ * Meta returned, which is what tells T8's echo handler that the copy arriving on
+ * the webhook is our own send and not a message the operator typed on his phone.
+ */
+export async function recordProspectSent(
+  db: D1Database,
+  s: {
+    mid: string;
+    leadId: string;
+    igUserId: string;
+    igsid: string;
+    draftId: string;
+    text: string;
+    sentAt: number;
+    /** The lead's message this reply answers, if the checks found one. */
+    inboundMid: string | null;
+  },
+): Promise<void> {
+  const statements = [
+    db
+      .prepare(
+        `UPDATE prospect_threads
+         SET version = version + 1, last_outbound_at = ?, updated_at = ?
+         WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled' AND igsid = ?`,
+      )
+      .bind(s.sentAt, s.sentAt, s.leadId, s.igUserId, s.igsid),
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO prospect_messages
+           (mid, lead_id, direction, origin, text, sent_at, idem, created_at)
+         VALUES (?, ?, 'out', 'api', ?, ?, ?, ?)`,
+      )
+      .bind(s.mid, s.leadId, s.text, s.sentAt, s.draftId, s.sentAt),
+    db
+      .prepare(
+        `UPDATE prospect_drafts SET status = 'sent'
+         WHERE draft_id = ? AND status IN ('approved', 'waiting')`,
+      )
+      .bind(s.draftId),
+  ];
+  if (s.inboundMid !== null) {
+    statements.push(
+      db
+        .prepare(
+          `UPDATE prospect_messages SET answered_at = ?
+           WHERE mid = ? AND lead_id = ? AND direction = 'in'`,
+        )
+        .bind(s.sentAt, s.inboundMid, s.leadId),
+    );
+  }
+
+  await db.batch(statements);
+}
+
 /* ------------------------------------------------- goals for the mobile page */
 
 /**

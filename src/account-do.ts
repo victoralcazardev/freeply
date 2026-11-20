@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import * as db from "./db";
-import { replyToComment, sendMessage, sendPrivateReply } from "./instagram";
+import { replyToComment, sendMessage, sendPrivateReply, type SendResult } from "./instagram";
+import { blockProspectSend, checkProspectSend, setProspectDraftStatus } from "./prospects-send";
 
 const PRUNE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -26,8 +27,17 @@ export interface SendJob {
    * `dm` answers someone already in an open 24-hour window, which a story reply
    * opens by arriving. They fail differently and are worth telling apart in the
    * log, but they share every retry rule.
+   *
+   * `prospect_reply` is the mobile page's approval (and, later, the autopilot
+   * cron): same outbox, same claim, same backoff, but its own five checks and
+   * its own rule for a request that never got an answer.
    */
-  kind: "private_reply" | "dm";
+  kind: "private_reply" | "dm" | "prospect_reply";
+  /** For a `prospect_reply`: the draft being sent, and the thread it answers.
+   *  Both are re-read from D1 before every attempt — these only say where to
+   *  look. `commentId` doubles as the draft id, which is unique on its own. */
+  draftId?: string;
+  leadId?: string;
   /** Who to send to, for a `dm`. Ignored for a private reply, which addresses
    *  the comment instead. */
   recipientId?: string;
@@ -200,6 +210,11 @@ export class AccountDO extends DurableObject<SendEnv> {
   }
 
   private async attempt(job: SendJob, attempts: number): Promise<string> {
+    // A prospect reply rides the same outbox but not the same message. Its
+    // outcome is recorded in the conversation, not in `sends`, and a request
+    // Meta never answered is not retried at all.
+    if (job.kind === "prospect_reply") return this.attemptProspect(job, attempts);
+
     // Re-read the token every attempt: a retry can outlive a refresh, and the
     // point of the refresh cron is that the token in D1 is the good one.
     const token = await db.getAccountToken(this.env.DB, this.env.ENCRYPTION_KEY, job.igUserId);
@@ -261,6 +276,137 @@ export class AccountDO extends DurableObject<SendEnv> {
     return this.settle(job, "failed", result.error);
   }
 
+  /**
+   * One attempt at a prospect reply, checks first.
+   *
+   * The checks re-read D1 here rather than trusting the job, because the whole
+   * point of them is what is true *now*: between an approval and its second
+   * attempt the window can shut, the lead can write again, and the authorization
+   * can expire. A refusal releases the claim and settles the draft with its code.
+   */
+  private async attemptProspect(job: SendJob, attempts: number): Promise<string> {
+    const draftId = job.draftId ?? job.commentId;
+
+    const check = await checkProspectSend(this.env.DB, {
+      draftId,
+      leadId: job.leadId ?? "",
+      igUserId: job.igUserId,
+    });
+    if (!check.ok) {
+      // Nothing was sent, so nothing blocks a later attempt: release the claim
+      // and let the draft say why it did not go out. The outbox row is settled
+      // here too — a refused retry left due would be refused again by every
+      // alarm, and the alarm would never stop rescheduling it.
+      this.release(job.dedupeKey, job.commenterId);
+      this.forget(job);
+      await blockProspectSend(this.env.DB, draftId, check.code);
+      console.error(`prospect reply blocked (${check.code})`);
+      return `blocked:${check.code}`;
+    }
+
+    const token = await db.getAccountToken(this.env.DB, this.env.ENCRYPTION_KEY, job.igUserId);
+    if (!token) {
+      // The token, not this draft. Back to the queue so approving again after a
+      // reconnect is all it takes, and out of the outbox: there is nothing left
+      // for a retry to do until a person reconnects.
+      this.release(job.dedupeKey, job.commenterId);
+      this.forget(job);
+      await setProspectDraftStatus(this.env.DB, draftId, "waiting");
+      console.error("prospect reply failed: no usable access token — reconnect the account");
+      return "failed";
+    }
+
+    let result: SendResult;
+    try {
+      result = await sendMessage(job.igUserId, check.recipientId, check.text, token);
+    } catch (cause) {
+      // `post` catches a request that never connected, but not a response body
+      // that dies while being read. The request reached Meta either way, so the
+      // outcome is unknown and this must not go back into the retry path: left
+      // to thrown, drain's own catch would defer it and send a second DM.
+      return this.unknownProspectOutcome(job, draftId, `${cause}`);
+    }
+
+    if (result.ok) {
+      if (!result.messageId) {
+        // Delivered, but with nothing to recognise the echo by. "Unknown" is the
+        // only honest answer, and it keeps this out of the retry path.
+        return this.unknownProspectOutcome(job, draftId, "sent without a message id");
+      }
+
+      console.log(`sent prospect reply for draft ${draftId}`);
+      // Drop the outbox row before recording, so nothing can drain this job
+      // again and spend a second DM on the same draft.
+      this.forget(job);
+      try {
+        await this.record(job, "sent", undefined, {
+          mid: result.messageId,
+          text: check.text,
+          igsid: check.recipientId,
+          inboundMid: check.inboundMid,
+        });
+      } catch (cause) {
+        console.error(`delivered but could not record prospect reply for ${draftId}:`, cause);
+      }
+      return "sent";
+    }
+
+    // `status === 0` is the request that never got an answer: a timeout or a
+    // dropped connection, which `classify` calls retryable because for a comment
+    // that is the safe guess. For a DM it is not — the message may have landed,
+    // and two identical replies to a lead is worse than one a person checks.
+    if (result.status === 0) {
+      return this.unknownProspectOutcome(job, draftId, result.error ?? "no answer from Meta");
+    }
+
+    // Meta answered with an error, so nothing was sent. Temporarily throttled:
+    // the existing backoff applies, and each retry runs these checks again.
+    if (result.retryable && attempts + 1 < MAX_ATTEMPTS) {
+      return this.defer(job, attempts, `prospect reply failed (${result.status}): ${result.error}`);
+    }
+
+    if (result.authFailure) {
+      await db.markNeedsReconnect(this.env.DB, job.igUserId, result.error ?? "token rejected");
+    }
+
+    // Either the token is gone or Meta refused for a reason that will repeat.
+    // The message did not go out, so the draft returns to the queue instead of
+    // pretending it did; the claim goes with it so a fixed draft can be approved.
+    this.release(job.dedupeKey, job.commenterId);
+    this.forget(job);
+    await setProspectDraftStatus(this.env.DB, draftId, "waiting");
+    console.error(`prospect reply failed permanently (${result.status}):`, result.error);
+    return "failed";
+  }
+
+  /**
+   * A prospect attempt whose outcome cannot be proven is terminal.
+   *
+   * A timeout, a dropped connection, a body that never finished: the request may
+   * have reached Meta, so it is never retried. The outbox row goes first, before
+   * anything that can fail, so no later D1 or alarm error can put the message
+   * back into the retry path. The draft carries the uncertainty to the manual
+   * queue, where only a person can settle it.
+   */
+  private async unknownProspectOutcome(
+    job: SendJob,
+    draftId: string,
+    why: string,
+  ): Promise<string> {
+    this.release(job.dedupeKey, job.commenterId);
+    this.forget(job);
+    // Bookkeeping after the message may already be out: a D1 failure here has to
+    // be loud, but throwing would hand the job back to drain and queue a retry
+    // of a send nobody can prove did not land.
+    try {
+      await setProspectDraftStatus(this.env.DB, draftId, "send_state_unknown");
+    } catch (cause) {
+      console.error(`could not mark draft ${draftId} send_state_unknown:`, cause);
+    }
+    console.error(`prospect reply outcome unknown (${why}) — manual queue, never retried`);
+    return "send_state_unknown";
+  }
+
   /** Puts a job back with the next backoff on it, and makes sure we wake for it. */
   private async defer(job: SendJob, attempts: number, why: string): Promise<string> {
     const next = attempts + 1;
@@ -297,7 +443,30 @@ export class AccountDO extends DurableObject<SendEnv> {
 
   /** Writes one outcome to the send log. Separate from forget() so the success
    *  path can drop the outbox row first and swallow a bookkeeping failure. */
-  private async record(job: SendJob, status: string, error?: string): Promise<void> {
+  private async record(
+    job: SendJob,
+    status: string,
+    error?: string,
+    sent?: { mid: string; text: string; igsid: string; inboundMid: string | null },
+  ): Promise<void> {
+    if (job.kind === "prospect_reply") {
+      // A prospect send belongs to its conversation, never to `sends`, and only
+      // a confirmed delivery is worth writing: the mid is what T8 matches the
+      // echo against, and an attempt that sent nothing has no mid at all.
+      if (!sent || !job.leadId) return;
+      await db.recordProspectSent(this.env.DB, {
+        mid: sent.mid,
+        text: sent.text,
+        igsid: sent.igsid,
+        inboundMid: sent.inboundMid,
+        leadId: job.leadId,
+        igUserId: job.igUserId,
+        draftId: job.commentId,
+        sentAt: Date.now(),
+      });
+      return;
+    }
+
     await db.recordSend(this.env.DB, {
       campaignId: job.campaignId,
       igUserId: job.igUserId,
@@ -314,6 +483,13 @@ export class AccountDO extends DurableObject<SendEnv> {
    *  here reaches drain, which retries — safe, because nothing was sent. */
   private async settle(job: SendJob, status: string, error?: string): Promise<string> {
     this.forget(job);
+    if (job.kind === "prospect_reply") {
+      // Settled without a delivery, so the draft goes back to the queue instead
+      // of sitting `approved` behind a job that no longer exists. A draft whose
+      // outcome is unknown stays unknown: only a person can settle that one.
+      await setProspectDraftStatus(this.env.DB, job.draftId ?? job.commentId, "waiting");
+      return status;
+    }
     await this.record(job, status, error);
     return status;
   }

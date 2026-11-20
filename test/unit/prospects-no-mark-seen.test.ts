@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import accountDoSource from "../../src/account-do.ts?raw";
 import indexSource from "../../src/index.ts?raw";
 import prospectsSource from "../../src/prospects.ts?raw";
+import prospectsSendSource from "../../src/prospects-send.ts?raw";
 
 /**
  * S11: reading a lead's conversation must not mark it seen. Instagram stops
@@ -10,9 +12,16 @@ import prospectsSource from "../../src/prospects.ts?raw";
  * A source check is the honest test here: the rule is the absence of a call,
  * not an observable difference in a payload we might otherwise assert on.
  */
-describe("prospect webhook", () => {
-  it("never calls mark_seen", () => {
-    expect(indexSource).not.toContain("mark_seen");
-    expect(prospectsSource).not.toContain("mark_seen");
+describe("prospect webhook and sends", () => {
+  it("never calls mark_seen or any sender action", () => {
+    for (const source of [
+      indexSource,
+      prospectsSource,
+      prospectsSendSource,
+      accountDoSource,
+    ]) {
+      expect(source).not.toContain("mark_seen");
+      expect(source).not.toContain("sender_action");
+    }
   });
 });
