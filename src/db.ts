@@ -643,6 +643,10 @@ export interface ProspectThreadDetail {
   version: number;
   lastInboundAt: number | null;
   lastOutboundAt: number | null;
+  /** JSON text of the profile read (T14). Never an id Meta gave us (L12). */
+  profileSummary: string | null;
+  /** When that profile was read; the gate's `profile_read` evidence. */
+  profileReadAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -660,12 +664,15 @@ interface ProspectThreadDetailRow {
   version: number;
   last_inbound_at: number | null;
   last_outbound_at: number | null;
+  profile_summary: string | null;
+  profile_read_at: number | null;
   created_at: number;
   updated_at: number;
 }
 
 const PROSPECT_THREAD_COLUMNS = `lead_id, ig_user_id, igsid, handle, name, nicho, state, m1_sha,
-         m1_registered_at, version, last_inbound_at, last_outbound_at, created_at, updated_at`;
+         m1_registered_at, version, last_inbound_at, last_outbound_at, profile_summary,
+         profile_read_at, created_at, updated_at`;
 
 const toProspectThreadDetail = (r: ProspectThreadDetailRow): ProspectThreadDetail => ({
   leadId: r.lead_id,
@@ -680,6 +687,8 @@ const toProspectThreadDetail = (r: ProspectThreadDetailRow): ProspectThreadDetai
   version: r.version,
   lastInboundAt: r.last_inbound_at,
   lastOutboundAt: r.last_outbound_at,
+  profileSummary: r.profile_summary,
+  profileReadAt: r.profile_read_at,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
 });
@@ -701,6 +710,8 @@ export interface ProspectDraft {
   stage: string | null;
   text: string;
   baseVersion: number;
+  /** The M1 variant this draft was written under (L25); replies have none. */
+  variantId: string | null;
   status: ProspectDraftStatus;
   decidedAt: number | null;
   decidedText: string | null;
@@ -714,11 +725,16 @@ interface ProspectDraftRow {
   stage: string | null;
   text: string;
   base_version: number;
+  variant_id?: string | null;
   status: string;
   decided_at: number | null;
   decided_text: string | null;
   created_at: number;
 }
+
+/** One list, used by every read: a dropped column would read as `undefined`, not as an error. */
+const PROSPECT_DRAFT_COLUMNS = `draft_id, lead_id, kind, stage, text, base_version, variant_id, status,
+         decided_at, decided_text, created_at`;
 
 const toProspectDraft = (r: ProspectDraftRow): ProspectDraft => ({
   draftId: r.draft_id,
@@ -727,6 +743,7 @@ const toProspectDraft = (r: ProspectDraftRow): ProspectDraft => ({
   stage: r.stage,
   text: r.text,
   baseVersion: r.base_version,
+  variantId: r.variant_id ?? null,
   status: r.status as ProspectDraftStatus,
   decidedAt: r.decided_at,
   decidedText: r.decided_text,
@@ -801,22 +818,41 @@ export async function upsertProspectThread(
     handle: string;
     name: string | null;
     nicho: string | null;
+    /** Profile evidence to record with this refresh; the stored one is kept otherwise. */
+    profile?: { summary: string; readAt: number } | null;
   },
 ): Promise<ProspectThreadDetail> {
   const now = Date.now();
+  const profileSummary = t.profile?.summary ?? null;
+  const profileReadAt = t.profile?.readAt ?? null;
   await db
     .prepare(
       `INSERT INTO prospect_threads
          (lead_id, ig_user_id, igsid, handle, name, nicho, state, m1_sha, m1_registered_at,
-          version, last_inbound_at, last_outbound_at, created_at, updated_at)
-       VALUES (?, ?, NULL, ?, ?, ?, 'm1_pendiente', NULL, NULL, 0, NULL, NULL, ?, ?)
+          version, last_inbound_at, last_outbound_at, profile_summary, profile_read_at,
+          created_at, updated_at)
+       VALUES (?, ?, NULL, ?, ?, ?, 'm1_pendiente', NULL, NULL, 0, NULL, NULL, ?, ?, ?, ?)
        ON CONFLICT (lead_id) DO UPDATE SET
          handle = excluded.handle,
          name = excluded.name,
          nicho = excluded.nicho,
+         -- Evidence a reply depends on is only ever added: a Sheet resync that
+         -- says nothing about the profile must not erase a read that happened.
+         profile_summary = COALESCE(excluded.profile_summary, profile_summary),
+         profile_read_at = COALESCE(excluded.profile_read_at, profile_read_at),
          updated_at = excluded.updated_at`,
     )
-    .bind(t.leadId, t.igUserId, t.handle, t.name, t.nicho, now, now)
+    .bind(
+      t.leadId,
+      t.igUserId,
+      t.handle,
+      t.name,
+      t.nicho,
+      profileSummary,
+      profileReadAt,
+      now,
+      now,
+    )
     .run();
 
   const thread = await getProspectThread(db, t.leadId);
@@ -868,9 +904,9 @@ export async function insertProspectDraft(
   const result = await db
     .prepare(
       `INSERT OR IGNORE INTO prospect_drafts
-         (draft_id, lead_id, kind, stage, text, base_version, status, decided_at, decided_text,
-          created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (draft_id, lead_id, kind, stage, text, base_version, variant_id, status, decided_at,
+          decided_text, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       d.draftId,
@@ -879,6 +915,7 @@ export async function insertProspectDraft(
       d.stage,
       d.text,
       d.baseVersion,
+      d.variantId,
       d.status,
       d.decidedAt,
       d.decidedText,
@@ -889,18 +926,56 @@ export async function insertProspectDraft(
   return (result.meta.changes ?? 0) > 0;
 }
 
-export async function insertProspectAuthorization(
+/**
+ * Records the CLI's gate answer for one (draft, category).
+ *
+ * Upsert, not insert: the Pi is stateless and re-runs its `authorize` phase on
+ * every pass, so an insert would add a row per pass and export a growing pile
+ * that says nothing new. `created_at` is the moment autonomy was granted, and
+ * the cron's human delay counts from it (`prospectAutopilotDueAt`); re-recording
+ * the same grant keeps it, because restamping would push the send another three
+ * to twelve minutes away on every pass and it would never become due. A row that
+ * turns a refusal into a grant starts the clock now: there was no permission
+ * before this pass, so there is no earlier moment to count from.
+ */
+export async function upsertProspectAuthorization(
   db: D1Database,
   a: ProspectAuthorization,
-): Promise<void> {
-  await db
+): Promise<{ created: boolean; authorization: ProspectAuthorization }> {
+  const updated = await db
     .prepare(
-      `INSERT INTO prospect_authorizations
-         (draft_id, category, gate_reason, expires_at, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `UPDATE prospect_authorizations
+       SET gate_reason = ?, expires_at = ?,
+           created_at = CASE WHEN gate_reason = '' AND ? = '' THEN created_at ELSE ? END
+       WHERE draft_id = ? AND category = ?`,
     )
-    .bind(a.draftId, a.category, a.gateReason, a.expiresAt, a.createdAt)
+    .bind(a.gateReason, a.expiresAt, a.gateReason, a.createdAt, a.draftId, a.category)
     .run();
+
+  const created = (updated.meta.changes ?? 0) === 0;
+  if (created) {
+    await db
+      .prepare(
+        `INSERT INTO prospect_authorizations
+           (draft_id, category, gate_reason, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .bind(a.draftId, a.category, a.gateReason, a.expiresAt, a.createdAt)
+      .run();
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT draft_id, category, gate_reason, expires_at, created_at
+       FROM prospect_authorizations
+       WHERE draft_id = ? AND category = ?
+       ORDER BY expires_at DESC, created_at DESC LIMIT 1`,
+    )
+    .bind(a.draftId, a.category)
+    .first<ProspectAuthorizationRow>();
+  if (!row) throw new Error(`prospect authorization ${a.draftId}/${a.category} vanished after upsert`);
+
+  return { created, authorization: toProspectAuthorization(row) };
 }
 
 interface ProspectAuthorizationRow {
@@ -909,6 +984,45 @@ interface ProspectAuthorizationRow {
   gate_reason: string;
   expires_at: number;
   created_at: number;
+}
+
+const toProspectAuthorization = (r: ProspectAuthorizationRow): ProspectAuthorization => ({
+  draftId: r.draft_id,
+  category: r.category,
+  gateReason: r.gate_reason,
+  expiresAt: r.expires_at,
+  createdAt: r.created_at,
+});
+
+/**
+ * The authorizations that still stand for these drafts, for the CLI's export.
+ *
+ * Only rows inside their expiry: an expired one is history, and the CLI re-runs
+ * the gate on every pass rather than reading old answers. A refused row is
+ * included — it is current, its `gate_reason` is not empty, and the Worker never
+ * reads one as permission.
+ */
+export async function prospectAuthorizationsFor(
+  db: D1Database,
+  draftIds: readonly string[],
+  now = Date.now(),
+): Promise<ProspectAuthorization[]> {
+  const authorizations: ProspectAuthorization[] = [];
+
+  for (const ids of chunk(draftIds)) {
+    const { results } = await db
+      .prepare(
+        `SELECT draft_id, category, gate_reason, expires_at, created_at
+         FROM prospect_authorizations
+         WHERE expires_at > ? AND draft_id IN (${ids.map(() => "?").join(", ")})
+         ORDER BY draft_id ASC, category ASC`,
+      )
+      .bind(now, ...ids)
+      .all<ProspectAuthorizationRow>();
+    authorizations.push(...results.map(toProspectAuthorization));
+  }
+
+  return authorizations;
 }
 
 /**
@@ -1135,8 +1249,7 @@ async function latestM1Texts(
   for (const ids of chunk(leadIds)) {
     const { results } = await db
       .prepare(
-        `SELECT draft_id, lead_id, kind, stage, text, base_version, status, decided_at,
-                decided_text, created_at
+        `SELECT ${PROSPECT_DRAFT_COLUMNS}
          FROM prospect_drafts
          WHERE kind = 'm1' AND lead_id IN (${ids.map(() => "?").join(", ")})
          ORDER BY created_at ASC, draft_id ASC`,
@@ -1225,8 +1338,7 @@ async function replyDraftItems(
 ): Promise<ProspectQueueItem[]> {
   const { results } = await db
     .prepare(
-      `SELECT draft_id, lead_id, kind, stage, text, base_version, status, decided_at,
-              decided_text, created_at
+      `SELECT ${PROSPECT_DRAFT_COLUMNS}
        FROM prospect_drafts
        WHERE kind = 'reply' AND status IN (${statuses.map(() => "?").join(", ")})
        ORDER BY created_at ASC, draft_id ASC`,
@@ -1415,7 +1527,7 @@ export async function prospectWork(
     .prepare(
       `SELECT t.lead_id, t.ig_user_id, t.igsid, t.handle, t.name, t.nicho, t.state, t.m1_sha,
               t.m1_registered_at, t.version, t.last_inbound_at, t.last_outbound_at,
-              t.created_at, t.updated_at,
+              t.profile_summary, t.profile_read_at, t.created_at, t.updated_at,
               m.mid AS inbound_mid, m.text AS inbound_text, m.sent_at AS inbound_sent_at,
               m.origin AS inbound_origin, m.drafted_at AS inbound_drafted_at,
               m.answered_at AS inbound_answered_at
@@ -1583,6 +1695,7 @@ export async function prospectExport(
   threads: ProspectThreadDetail[];
   messages: ProspectMessage[];
   drafts: ProspectDraft[];
+  authorizations: ProspectAuthorization[];
 }> {
   const { results } = await db
     .prepare(
@@ -1593,15 +1706,14 @@ export async function prospectExport(
     .all<ProspectThreadDetailRow>();
 
   const threads = results.map(toProspectThreadDetail);
-  if (threads.length === 0) return { threads, messages: [], drafts: [] };
+  if (threads.length === 0) return { threads, messages: [], drafts: [], authorizations: [] };
 
   const messages = await prospectMessagesFor(db, threads.map((t) => t.leadId));
   const drafts: ProspectDraft[] = [];
   for (const ids of chunk(threads.map((t) => t.leadId))) {
     const { results: rows } = await db
       .prepare(
-        `SELECT draft_id, lead_id, kind, stage, text, base_version, status, decided_at,
-                decided_text, created_at
+        `SELECT ${PROSPECT_DRAFT_COLUMNS}
          FROM prospect_drafts
          WHERE lead_id IN (${ids.map(() => "?").join(", ")})
          ORDER BY created_at ASC, draft_id ASC`,
@@ -1611,7 +1723,12 @@ export async function prospectExport(
     drafts.push(...rows.map(toProspectDraft));
   }
 
-  return { threads, messages, drafts };
+  const authorizations = await prospectAuthorizationsFor(
+    db,
+    drafts.map((d) => d.draftId),
+  );
+
+  return { threads, messages, drafts, authorizations };
 }
 
 /* --------------------------------------------------------------- campaigns */

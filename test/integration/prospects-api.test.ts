@@ -298,6 +298,133 @@ describe("POST /api/prospects/threads", () => {
       ).status,
     ).toBe(400);
   });
+
+  it("tells a stateless pass whether the row was new or a refresh", async () => {
+    const created = await call("POST", "/api/prospects/threads", {
+      lead_id: "lead-1",
+      handle: "ana.leads",
+    });
+    expect(created.status).toBe(201);
+    expect(created.json.created).toBe(true);
+
+    const refreshed = await call("POST", "/api/prospects/threads", {
+      lead_id: "lead-1",
+      handle: "ana.leads",
+      nicho: "viajes",
+    });
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.json.created).toBe(false);
+
+    // Arming the M1 on an existing thread is a refresh too, not a second create.
+    const armed = await call("POST", "/api/prospects/threads", {
+      lead_id: "lead-1",
+      handle: "ana.leads",
+      m1_text: "Hola, soy Víctor.",
+    });
+    expect(armed.status).toBe(200);
+    expect(armed.json.created).toBe(false);
+  });
+
+  /** What T14's Business Discovery read hands the CLI: profile data, never an id. */
+  const PROFILE = {
+    handle: "ana.leads",
+    name: "Ana",
+    biography: "Agencia de viajes boutique · Japón y Escandinavia",
+    followers: 12400,
+    media_count: 87,
+    website: "https://analeds.example",
+    recent_posts: [
+      {
+        caption: "Nuevo destino: Japón en otoño",
+        date: "2026-11-02",
+        permalink: "https://www.instagram.com/p/Cabc123/",
+        source: "business_discovery",
+      },
+    ],
+    source: "business_discovery",
+  };
+
+  it("stores the profile evidence a reply can quote, and keeps it across a refresh", async () => {
+    const readAt = Date.now() - HOUR;
+    const created = await call("POST", "/api/prospects/threads", {
+      lead_id: "lead-1",
+      handle: "ana.leads",
+      profile_summary: PROFILE,
+      profile_read_at: readAt,
+    });
+    expect(created.status).toBe(201);
+    expect(created.json.thread.profile_summary).toEqual(PROFILE);
+    expect(created.json.thread.profile_read_at).toBe(readAt);
+
+    // The Sheet resync sends the Sheet's columns only. Evidence a reply depends
+    // on is not erased by a refresh that does not mention it.
+    const refreshed = await call("POST", "/api/prospects/threads", {
+      lead_id: "lead-1",
+      handle: "ana.leads",
+      nicho: "viajes",
+    });
+    expect(refreshed.json.thread.profile_summary).toEqual(PROFILE);
+    expect(refreshed.json.thread.profile_read_at).toBe(readAt);
+
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.json.threads).toEqual([
+      expect.objectContaining({
+        lead_id: "lead-1",
+        profile_summary: PROFILE,
+        profile_read_at: readAt,
+      }),
+    ]);
+
+    // Once the echo enrolled the thread, the profile is what M2 and the Filtro
+    // are authorized on — so a refresh has to be able to record it there too.
+    await call("POST", "/api/prospects/expected-m1", {
+      lead_id: "lead-1",
+      text: "Hola, soy Víctor.",
+    });
+    await deliver(
+      echo({ text: "Hola, soy Víctor.", peerId: "peer-1", mid: "mid_echo_lead-1", at: readAt }),
+    );
+    const later = { ...PROFILE, followers: 12500 };
+    const enrolled = await call("POST", "/api/prospects/threads", {
+      lead_id: "lead-1",
+      handle: "ana.leads",
+      profile_summary: later,
+      profile_read_at: Date.now(),
+    });
+    expect(enrolled.status).toBe(200);
+    expect(enrolled.json.thread).toMatchObject({ state: "enrolled", profile_summary: later });
+  });
+
+  it("refuses profile evidence that carries an account id, is not an object, or is oversized", async () => {
+    const post = { caption: "Un viaje", permalink: "https://www.instagram.com/p/Cabc123/" };
+    const cases: Array<[unknown, string]> = [
+      [{ igsid: "17841400000000001" }, "profile_summary: must not carry an account id"],
+      [
+        { recent_posts: [{ ...post, id: "17841400000000001" }] },
+        "profile_summary: must not carry an account id",
+      ],
+      // A bare digit run is an id wherever it sits: a profile read is not a way
+      // to address a message (L12).
+      [{ recent_posts: [post], source: "17841400000000001" }, "profile_summary: must not carry an account id"],
+      ["biography: Ana", "profile_summary: must be a JSON object"],
+      [[post], "profile_summary: must be a JSON object"],
+      [{ biography: "x".repeat(9000) }, "profile_summary: over 8192 bytes"],
+    ];
+
+    for (const [profile_summary, detail] of cases) {
+      expect(
+        await call("POST", "/api/prospects/threads", {
+          lead_id: "lead-1",
+          handle: "ana.leads",
+          profile_summary,
+        }),
+      ).toEqual({ status: 400, json: { error: "invalid_field", detail } });
+    }
+
+    // None of them wrote anything: the payload is validated before the thread is
+    // touched, so a refusal cannot leave half a row behind.
+    expect((await call("GET", "/api/prospects/export")).json.threads).toEqual([]);
+  });
 });
 
 describe("POST /api/prospects/expected-m1", () => {
@@ -398,6 +525,58 @@ describe("POST /api/prospects/drafts", () => {
       status: 400,
       json: { error: "invalid_field", detail: "kind: must be m1 or reply" },
     });
+  });
+
+  it("stores the M1 variant and exports it, which is what the A/B rate is counted on", async () => {
+    const first = await call("POST", "/api/prospects/drafts", { ...draft, variant_id: "B" });
+    expect(first.status).toBe(201);
+    expect(first.json.draft.variant_id).toBe("B");
+
+    // A reply has no variant, and the field is present and null rather than
+    // missing: a caller reading the export never has to guess.
+    const reply = await call("POST", "/api/prospects/drafts", {
+      draft_id: "draft-2",
+      lead_id: "lead-1",
+      kind: "reply",
+      stage: "Filtro",
+      text: "Gracias por responder.",
+      base_version: 0,
+    });
+    expect(reply.json.draft.variant_id).toBeNull();
+
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.json.drafts.map((d: any) => [d.draft_id, d.variant_id])).toEqual([
+      ["draft-1", "B"],
+      ["draft-2", null],
+    ]);
+  });
+
+  it("keeps variant ids canonical and short, and a changed one is a conflict", async () => {
+    // The CLI upper-cases before pushing; the Worker keeps one cohort, not A and a.
+    const created = await call("POST", "/api/prospects/drafts", { ...draft, variant_id: "a" });
+    expect(created.status).toBe(201);
+    expect(created.json.draft.variant_id).toBe("A");
+
+    // The same draft_id with another variant is another draft, not a retry.
+    expect(await call("POST", "/api/prospects/drafts", { ...draft, variant_id: "B" })).toEqual({
+      status: 409,
+      json: { error: "draft_conflict", detail: "draft_id: already stored with different content" },
+    });
+
+    for (const [variant_id, detail] of [
+      ["A/B", "variant_id: must be 1-8 characters A-Z"],
+      ["AAAAAAAAA", "variant_id: must be 1-8 characters A-Z"],
+      [3, "variant_id: must be a string or null"],
+    ] as const) {
+      expect(
+        await call("POST", "/api/prospects/drafts", {
+          ...draft,
+          draft_id: `draft-${variant_id}`,
+          variant_id,
+        }),
+      ).toEqual({ status: 400, json: { error: "invalid_field", detail } });
+    }
+    expect(await draftCount()).toBe(1);
   });
 });
 
@@ -569,6 +748,124 @@ describe("POST /api/prospects/authorizations", () => {
       json: { error: "invalid_field", detail: "expires_at: must be an integer >= 0" },
     });
   });
+
+  /** A registered thread with one waiting reply draft, ready to be authorized. */
+  async function authorizableDraft(): Promise<void> {
+    await call("POST", "/api/prospects/threads", { lead_id: "lead-1", handle: "ana.leads" });
+    await call("POST", "/api/prospects/drafts", {
+      draft_id: "draft-1",
+      lead_id: "lead-1",
+      kind: "reply",
+      stage: "Filtro",
+      text: "Gracias por responder.",
+      base_version: 0,
+    });
+  }
+
+  it("upserts on (draft_id, category): a repeated pass rewrites one row and keeps its age", async () => {
+    await authorizableDraft();
+    const now = Date.now();
+    const authorize = (over: Record<string, unknown> = {}) =>
+      call("POST", "/api/prospects/authorizations", {
+        draft_id: "draft-1",
+        category: "copro_filter",
+        gate_reason: "",
+        expires_at: now + HOUR,
+        ...over,
+      });
+
+    const first = await authorize();
+    expect(first.status).toBe(201);
+    expect(first.json.created).toBe(true);
+
+    // The cron's human delay runs from the moment autonomy was granted, so age
+    // the row the way an earlier pass would have left it.
+    const grantedAt = now - HOUR;
+    await env.DB.prepare(`UPDATE prospect_authorizations SET created_at = ?`)
+      .bind(grantedAt)
+      .run();
+
+    const later = now + 3 * HOUR;
+    const again = await authorize({ expires_at: later });
+    expect(again.status).toBe(200);
+    expect(again.json.created).toBe(false);
+    expect(again.json.authorization).toMatchObject({
+      draft_id: "draft-1",
+      category: "copro_filter",
+      gate_reason: "",
+      expires_at: later,
+      // Not restamped: re-recording the grant on every pass would push the send
+      // another few minutes away each time, and the autopilot would never send.
+      created_at: grantedAt,
+    });
+
+    const rows = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM prospect_authorizations WHERE draft_id = ?`,
+    )
+      .bind("draft-1")
+      .first<{ n: number }>();
+    expect(rows?.n).toBe(1);
+
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.json.authorizations).toEqual([
+      {
+        draft_id: "draft-1",
+        category: "copro_filter",
+        gate_reason: "",
+        expires_at: later,
+        created_at: grantedAt,
+      },
+    ]);
+  });
+
+  it("keeps one row per category, exports only current rows, and lets a refusal replace the grant", async () => {
+    await authorizableDraft();
+    const now = Date.now();
+    const authorize = (over: Record<string, unknown> = {}) =>
+      call("POST", "/api/prospects/authorizations", {
+        draft_id: "draft-1",
+        category: "copro_filter",
+        gate_reason: "",
+        expires_at: now + HOUR,
+        ...over,
+      });
+
+    expect((await authorize()).status).toBe(201);
+    expect((await authorize({ category: "copro_m2", expires_at: now + 2 * HOUR })).status).toBe(201);
+
+    // The gate now refuses this draft. The row is rewritten rather than added,
+    // so the Worker still reads one answer per category — and an empty gate
+    // reason is the only one that is permission.
+    expect((await authorize({ gate_reason: "copro_template_mismatch" })).status).toBe(200);
+
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.json.authorizations).toEqual([
+      expect.objectContaining({
+        draft_id: "draft-1",
+        category: "copro_filter",
+        gate_reason: "copro_template_mismatch",
+        expires_at: now + HOUR,
+      }),
+      expect.objectContaining({
+        draft_id: "draft-1",
+        category: "copro_m2",
+        gate_reason: "",
+        expires_at: now + 2 * HOUR,
+      }),
+    ]);
+
+    // An expired row is history, not permission, so it is not part of the export.
+    await env.DB.prepare(
+      `UPDATE prospect_authorizations SET expires_at = ? WHERE category = 'copro_m2'`,
+    )
+      .bind(now - 1000)
+      .run();
+    expect(
+      (await call("GET", "/api/prospects/export")).json.authorizations.map(
+        (a: any) => a.category,
+      ),
+    ).toEqual(["copro_filter"]);
+  });
 });
 
 describe("GET /api/prospects/export", () => {
@@ -622,7 +919,7 @@ describe("GET /api/prospects/export", () => {
     ]);
 
     const since = await call("GET", `/api/prospects/export?since=${now + HOUR}`);
-    expect(since.json).toEqual({ threads: [], messages: [], drafts: [] });
+    expect(since.json).toEqual({ threads: [], messages: [], drafts: [], authorizations: [] });
   });
 
   it("rejects a since that is not an epoch-millisecond integer", async () => {

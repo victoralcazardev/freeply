@@ -449,6 +449,30 @@ describe("GET /prospects", () => {
     expect(section(html, "m1-sin-confirmar")).toContain("hace 2 h");
   });
 
+  it("offers the optional warming hint on the send queue and adds no action for it", async () => {
+    await pendingLead({ leadId: "lead-nuevo", name: "Ana", m1Draft: "Hola, Ana." });
+    const { html } = await getPage("/prospects");
+
+    const m1 = section(html, "m1-por-enviar");
+    expect(m1).toContain("Opcional: síguela y comenta o responde a una story");
+    expect(m1).toContain("≥24 h antes");
+
+    // A suggestion, not a step: the paragraph carries no link, button or form of
+    // its own, and the card keeps the one action it had (copy and register).
+    const hint = m1.slice(m1.indexOf("Opcional:"));
+    const paragraph = hint.slice(0, hint.indexOf("</p>"));
+    expect(paragraph).not.toContain("<a ");
+    expect(paragraph).not.toContain("<button");
+    expect(paragraph).not.toContain("<form");
+    expect(m1.match(/action="\/prospects\//g)).toHaveLength(1);
+
+    // Only the queue that sends the M1: warming up is a step before it, not a
+    // thing to do once somebody replied.
+    expect(section(html, "m1-sin-confirmar")).not.toContain("Opcional:");
+    expect(section(html, "borradores")).not.toContain("Opcional:");
+    expect(section(html, "manual")).not.toContain("Opcional:");
+  });
+
   it("flags a draft whose window is nearly closed and drops the closed one into manual", async () => {
     const now = Date.now();
     const soon = await enrolledLead({

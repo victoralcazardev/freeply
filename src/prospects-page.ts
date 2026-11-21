@@ -331,6 +331,9 @@ function m1Card(item: db.ProspectM1Item, now: number, i: number): string {
         ? ` · <span class="tag">Registrado hace ${ago(now - thread.m1RegisteredAt)}</span>`
         : ""
     }</p>
+    <p class="small muted">Opcional: síguela y comenta o responde a una story ≥24 h antes. Nada lo
+      bloquea — es una sugerencia para que el primer mensaje no llegue en frío a alguien que nunca
+      te ha visto.</p>
     <form method="post" action="/prospects/m1">
       <input type="hidden" name="lead_id" value="${esc(thread.leadId)}">
       <label for="m1-text-${i}">Mensaje <span class="muted">— edítalo antes de copiar</span></label>

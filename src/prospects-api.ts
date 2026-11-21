@@ -20,6 +20,13 @@ const MAX_TEXT_BYTES = 4000;
 const MAX_ID_BYTES = 200;
 const MAX_LABEL_BYTES = 500;
 
+/**
+ * A profile read is a fixed shape in the CLI (bio, follower count and five posts
+ * with 200-character captions, T14), so this is several times what one can hold
+ * while still bounding what a single thread may store.
+ */
+const MAX_PROFILE_SUMMARY_BYTES = 8192;
+
 const bytes = (s: string) => new TextEncoder().encode(s).length;
 
 /** A required, trimmed, non-empty string within a byte cap. */
@@ -65,6 +72,72 @@ function integer(value: unknown, field: string, min: number): number | Response 
 }
 
 /**
+ * The M1 variant a draft was written under (A/B/C, L25).
+ *
+ * A cohort label, so it is canonical: upper-cased, 1 to 8 letters. Blank and
+ * null both mean "no variant", which is every reply and every draft written
+ * before the A/B test. Normalizing here keeps `A` and `a` from splitting one
+ * cohort into two rates that were never measured apart.
+ */
+function variantId(value: unknown): string | null | Response {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") return invalid("variant_id", "must be a string or null");
+  const id = value.trim().toUpperCase();
+  if (!id) return null;
+  if (!/^[A-Z]{1,8}$/.test(id)) return invalid("variant_id", "must be 1-8 characters A-Z");
+  return id;
+}
+
+/** Keys that name an account, at any depth of the profile object. */
+const PROFILE_ID_KEYS = /^(id|igsid|ig_user_id|user_id|userid|pk|scoped_id|platform_id|page_id)$/;
+/** A bare digit run long enough to be one of Meta's ids (they are 15-17 digits). */
+const LONG_NUMBER = /^\d{10,25}$/;
+
+function carriesAccountId(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(carriesAccountId);
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>).some(
+      ([key, inner]) => PROFILE_ID_KEYS.test(key.trim().toLowerCase()) || carriesAccountId(inner),
+    );
+  }
+  return typeof value === "string" && LONG_NUMBER.test(value.trim());
+}
+
+/**
+ * The profile evidence the CLI read (T14), as the JSON text `prospect_threads`
+ * stores; null when the caller sent none.
+ *
+ * The field allow-list already lives in the CLI, so the rule that has to hold on
+ * this side is the privacy one: a profile read gives profile data and never a
+ * way to address a message (L12). Anything shaped like an account id — a key
+ * named for one, or a bare digit run — is refused rather than stored on a thread
+ * that also holds an IGSID.
+ */
+function profileEvidence(
+  summary: unknown,
+  readAt: unknown,
+): { summary: string; readAt: number } | null | Response {
+  if (readAt !== undefined) {
+    const at = integer(readAt, "profile_read_at", 0);
+    if (at instanceof Response) return at;
+  }
+  if (summary === null || summary === undefined) return null;
+  if (typeof summary !== "object" || Array.isArray(summary)) {
+    return invalid("profile_summary", "must be a JSON object");
+  }
+  if (carriesAccountId(summary)) return invalid("profile_summary", "must not carry an account id");
+
+  const text = JSON.stringify(summary);
+  if (bytes(text) > MAX_PROFILE_SUMMARY_BYTES) {
+    return invalid("profile_summary", `over ${MAX_PROFILE_SUMMARY_BYTES} bytes`);
+  }
+  // The CLI sends the moment it read the profile; without one, the moment the
+  // evidence reached D1 is the only timestamp that is not invented.
+  const at = readAt === undefined ? Date.now() : (readAt as number);
+  return { summary: text, readAt: at };
+}
+
+/**
  * The account a new thread belongs to. One connected account is the normal case
  * (`@victoralcazar`); with several, the caller has to say which.
  */
@@ -87,6 +160,21 @@ async function accountFor(env: Env, requested: unknown): Promise<string | Respon
   return accounts[0].igUserId;
 }
 
+/**
+ * The stored profile JSON, back as the object the CLI pushed.
+ *
+ * Only `profileEvidence` writes the column, so unparseable text is a bug rather
+ * than data: report no evidence instead of an object nobody can read.
+ */
+function storedProfileSummary(raw: string | null): unknown {
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 function presentThread(t: db.ProspectThreadDetail) {
   return {
     lead_id: t.leadId,
@@ -100,6 +188,8 @@ function presentThread(t: db.ProspectThreadDetail) {
     version: t.version,
     last_inbound_at: t.lastInboundAt,
     last_outbound_at: t.lastOutboundAt,
+    profile_summary: storedProfileSummary(t.profileSummary),
+    profile_read_at: t.profileReadAt,
     created_at: t.createdAt,
     updated_at: t.updatedAt,
   };
@@ -113,10 +203,21 @@ function presentDraft(d: db.ProspectDraft) {
     stage: d.stage,
     text: d.text,
     base_version: d.baseVersion,
+    variant_id: d.variantId,
     status: d.status,
     decided_at: d.decidedAt,
     decided_text: d.decidedText,
     created_at: d.createdAt,
+  };
+}
+
+function presentAuthorization(a: db.ProspectAuthorization) {
+  return {
+    draft_id: a.draftId,
+    category: a.category,
+    gate_reason: a.gateReason,
+    expires_at: a.expiresAt,
+    created_at: a.createdAt,
   };
 }
 
@@ -170,6 +271,10 @@ async function createThread(request: Request, env: Env): Promise<Response> {
   const m1Text =
     body.m1_text === undefined ? null : required(body.m1_text, "m1_text", MAX_TEXT_BYTES);
   if (m1Text instanceof Response) return m1Text;
+  // Validated before anything is read or written: a payload the Worker refuses
+  // must not leave half a thread behind.
+  const profile = profileEvidence(body.profile_summary, body.profile_read_at);
+  if (profile instanceof Response) return profile;
 
   const existing = await db.getProspectThread(env.DB, leadId);
   // A thread is pinned to the account that will receive its echo; re-pointing it
@@ -195,17 +300,27 @@ async function createThread(request: Request, env: Env): Promise<Response> {
   const nicho = body.nicho === undefined ? (existing?.nicho ?? null) : label(body.nicho, "nicho");
   if (nicho instanceof Response) return nicho;
 
-  const thread = await db.upsertProspectThread(env.DB, { leadId, igUserId, handle, name, nicho });
-  const status = existing ? 200 : 201;
+  const thread = await db.upsertProspectThread(env.DB, {
+    leadId,
+    igUserId,
+    handle,
+    name,
+    nicho,
+    profile,
+  });
+  // The CLI is stateless and cannot tell a first registration from a refresh by
+  // the status code alone when it is reading a JSON body, so the answer says so.
+  const created = existing === null;
+  const status = created ? 201 : 200;
 
-  if (m1Text === null) return json({ thread: presentThread(thread) }, status);
+  if (m1Text === null) return json({ thread: presentThread(thread), created }, status);
   // Same registration the page's "copiar" performs, so there is one writer for
   // `m1_sha` and one set of rules about what may be armed.
   const registered = await registerExpectedM1(env.DB, leadId, m1Text);
   if (!registered.ok) {
     return fail(registered.error === "not_found" ? 404 : 409, registered.error);
   }
-  return json({ thread: presentThread(registered.thread) }, status);
+  return json({ thread: presentThread(registered.thread), created }, status);
 }
 
 /**
@@ -237,7 +352,8 @@ function sameDraft(stored: db.ProspectDraft, pushed: db.ProspectDraft): boolean 
     stored.kind === pushed.kind &&
     stored.stage === pushed.stage &&
     stored.text === pushed.text &&
-    stored.baseVersion === pushed.baseVersion
+    stored.baseVersion === pushed.baseVersion &&
+    stored.variantId === pushed.variantId
   );
 }
 
@@ -257,6 +373,8 @@ async function createDraft(request: Request, env: Env): Promise<Response> {
   if (baseVersion instanceof Response) return baseVersion;
   const stage = label(body.stage, "stage");
   if (stage instanceof Response) return stage;
+  const variant = variantId(body.variant_id);
+  if (variant instanceof Response) return variant;
 
   const thread = await db.getProspectThread(env.DB, leadId);
   if (!thread) return fail(404, "not_found");
@@ -273,6 +391,7 @@ async function createDraft(request: Request, env: Env): Promise<Response> {
     stage,
     text,
     baseVersion,
+    variantId: variant,
     status: "waiting",
     decidedAt: null,
     decidedText: null,
@@ -362,26 +481,19 @@ async function authorize(request: Request, env: Env): Promise<Response> {
 
   if (!(await db.getProspectDraft(env.DB, draftId))) return fail(404, "not_found");
 
-  const createdAt = Date.now();
-  await db.insertProspectAuthorization(env.DB, {
+  // An upsert on (draft_id, category): the Pi re-runs this phase on every pass,
+  // and a row per pass would make the export grow without saying anything new.
+  const saved = await db.upsertProspectAuthorization(env.DB, {
     draftId,
     category,
     gateReason,
     expiresAt,
-    createdAt,
+    createdAt: Date.now(),
   });
 
   return json(
-    {
-      authorization: {
-        draft_id: draftId,
-        category,
-        gate_reason: gateReason,
-        expires_at: expiresAt,
-        created_at: createdAt,
-      },
-    },
-    201,
+    { authorization: presentAuthorization(saved.authorization), created: saved.created },
+    saved.created ? 201 : 200,
   );
 }
 
@@ -405,10 +517,13 @@ async function exportState(env: Env, url: URL): Promise<Response> {
   const since = sinceParam(url);
   if (since instanceof Response) return since;
 
-  const { threads, messages, drafts } = await db.prospectExport(env.DB, since);
+  const { threads, messages, drafts, authorizations } = await db.prospectExport(env.DB, since);
   return json({
     threads: threads.map(presentThread),
     messages: messages.map(presentMessageMeta),
     drafts: drafts.map(presentDraft),
+    // Only the ones that still stand, so the CLI can tell what it already
+    // authorized instead of writing the same grant again on every pass.
+    authorizations: authorizations.map(presentAuthorization),
   });
 }

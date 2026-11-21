@@ -364,6 +364,61 @@ CORS. Responses are JSON; errors are `{"error": "...", "detail"?: "..."}`.
 Campaigns are saved through the same code as the dashboard form, including short-link
 minting. Invalid input is a 400 `invalid_field` naming the field.
 
+### Prospect API
+
+The same token and the same guard, over the coproducción flow: D1 is the only store, and
+a stateless client asks for work, leaves drafts and authorizations, and reads an export.
+Nothing here searches conversations — every read is keyed by the `lead_id` the operator
+registered, so a thread nobody registered has no address through which it could be
+reached. `igsid` (the id Meta gives the recipient) never appears in a response: it is how
+the webhook recognises a lead, not something a client needs.
+
+A thread is inert until the exact echo of the copied M1 comes back on the webhook. That
+is the only enrollment; nothing is matched by handle, prefix or timing.
+
+| Route | Does |
+|---|---|
+| `POST /api/prospects/threads` | Create or refresh a thread from the Sheet row (`lead_id`, `handle` required; optional `name`, `nicho`, `ig_user_id`, `m1_text`, `profile_summary`, `profile_read_at`). Answers `{thread, created}` — 201 and `created: true` for a new row, 200 and `false` for a refresh |
+| `POST /api/prospects/expected-m1` | Register the final text of the M1 (`lead_id`, `text`): stores its normalized sha256 and makes the thread wait for that exact echo. 409 `already_enrolled` once the echo arrived |
+| `POST /api/prospects/drafts` | Leave a draft for the mobile page (`draft_id`, `lead_id`, `kind` = `m1`/`reply`, `text`, `base_version`; optional `stage`, `variant_id`). Idempotent by `draft_id`: the same payload answers 200 `created: false`, a changed one is 409 `draft_conflict` |
+| `GET /api/prospects/work?limit=` | Enrolled threads whose latest message is the lead's, oldest wait first (limit 1–100, default 50), each with `expiring` from 20 h and `expired` past 24 h |
+| `POST /api/prospects/authorizations` | Record the autopilot gate result for one draft (`draft_id`, `category`, `expires_at`, optional `gate_reason`). An **upsert on `(draft_id, category)`**: a repeated pass rewrites the row instead of adding one, answers 200 `created: false`, and keeps the original `created_at` so the send delay does not restart |
+| `GET /api/prospects/export?since=` | Threads, message metadata, drafts and the authorizations that still stand (`since` is epoch ms; 0 means all) |
+
+**Message text is not in the export.** The board and the session summary need activity,
+not what anyone said, so messages carry `mid`, direction, origin and timestamps only.
+Drafts do carry their `text`, because a draft is what the CLI wrote and may have to
+reconcile; threads carry no message text at all.
+
+**`variant_id`** is the M1 variant (A/B/C) the draft was written under, so each variant's
+rate can be counted against its own denominator. It is upper-cased and must be 1–8
+letters A–Z; blank or absent means no variant, which is every reply. A different
+`variant_id` on an already stored `draft_id` is a `draft_conflict`.
+
+**`profile_summary`** is the profile evidence a reply quotes, from the read the client did
+before drafting: a JSON object (bio, followers, recent posts…) of at most 8 192 bytes,
+stored as text and returned as the object that was pushed. It is only ever added — a
+refresh that does not mention it keeps the stored one. The Worker refuses a payload that
+carries an account id (a key like `id`/`igsid`/`user_id`, or a bare 10–25 digit string),
+because a profile read is a way to personalise a message, never a way to address one.
+`profile_read_at` is when the profile was read; omit it and the moment the evidence
+reached D1 is used. Both are in the export.
+
+**Authorizations are permission only when current and approved.** The Worker reads the
+newest still-valid row for a draft, requires `gate_reason` to be empty, and never sends
+without one — the kill switch, the approved status, the conversation version and the
+24-hour window are all still checked immediately before every attempt, so a row written
+here can never make a send that those checks refuse. An expired authorization is not in
+the export; a refused one is, with its reason, so the CLI can see its own last answer.
+
+`/prospects` is the companion page: four queues over the same threads, behind the
+dashboard session, for the sessions on a phone.
+
+**How proven it is.** The echo enrollment was observed against live Meta (a DM sent from
+the phone came back with the recipient's IGSID). The rest of this flow — the API, the page,
+the send path and the autopilot cron — is implemented and covered by the test suite but
+has not yet carried a real conversation end to end.
+
 ## Things Meta doesn't tell you
 
 Every line here cost at least an hour to find.

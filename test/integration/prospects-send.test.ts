@@ -558,6 +558,44 @@ describe("the autopilot authorization", () => {
     expect((await draftRow("draft-1")).status).toBe("sent");
   });
 
+  it("sends on a grant written through the API, and never on one the same pass refused", async () => {
+    const now = Date.now();
+    await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
+    await pushDraft({ draftId: "draft-1" });
+    await pushDraft({ draftId: "draft-2", text: "Otra respuesta." });
+    const authorize = (draftId: string, over: Record<string, unknown> = {}) =>
+      call("POST", "/api/prospects/authorizations", {
+        draft_id: draftId,
+        category: "copro_filter",
+        gate_reason: "",
+        expires_at: now + HOUR,
+        ...over,
+      });
+
+    // The CLI's authorize phase, twice: the second pass renews the same grant
+    // instead of adding a row, and the send still finds it current.
+    expect((await authorize("draft-1")).status).toBe(201);
+    expect((await authorize("draft-1", { expires_at: now + 2 * HOUR })).status).toBe(200);
+    // And the same phase refusing this one: a current row that is not permission.
+    expect(
+      (await authorize("draft-2", { gate_reason: "copro_template_mismatch" })).status,
+    ).toBe(201);
+
+    await setDoSwitch("on");
+    stubMeta(() => ok("mid_api_auto"));
+
+    // The refused draft is checked first: sending the other one bumps the
+    // thread's version and would report `version_changed` instead of the answer
+    // to "was this authorized?".
+    expect(await account().deliver(job("draft-2"))).toBe("blocked:no_approval");
+    expect(calls).toEqual([]);
+
+    expect(await account().deliver(job("draft-1"))).toBe("sent");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body.message).toEqual({ text: "Gracias por responder." });
+    expect((await draftRow("draft-2")).status).toBe("waiting");
+  });
+
   it("blocks an expired authorization and one the gate refused", async () => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
