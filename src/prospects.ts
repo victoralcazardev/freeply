@@ -203,18 +203,28 @@ async function handleEcho(event: ProspectEvent, env: Env): Promise<void> {
 }
 
 /**
- * Closes the threads the lead never answered, fourteen days after the M1 echo
- * (T19). Runs on the scheduled trigger and is idempotent by state, so a second
- * run in the same hour writes nothing. The log is a count: a closed thread's
- * handle is not something the Worker's logs carry.
+ * Closes the threads that went fourteen days without a word (T19).
+ *
+ * Runs on the scheduled trigger and is idempotent by state, so a second run in
+ * the same hour writes nothing. Dropping the queued retries is the same work the
+ * page's manual close does: a draft retired by the close must not keep an alarm
+ * waking up for a send that can never be right. The log is a count: a closed
+ * thread's handle is not something the Worker's logs carry.
  */
 export async function closeUnansweredProspects(
   env: Env,
   now = Date.now(),
 ): Promise<number> {
   const closed = await db.closeUnansweredProspectThreads(env.DB, now);
-  if (closed > 0) console.log(`prospect followup: closed=${closed}`);
-  return closed;
+
+  for (const thread of closed) {
+    if (thread.draftIds.length === 0) continue;
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(thread.igUserId));
+    await account.forgetDrafts(thread.draftIds);
+  }
+
+  if (closed.length > 0) console.log(`prospect followup: closed=${closed.length}`);
+  return closed.length;
 }
 
 /**
@@ -278,7 +288,13 @@ export async function registerExpectedM1(
   if (thread.igsid !== null) return { ok: false, error: "already_enrolled" };
 
   // The echo is compared in normalized form, so the hash comes from that form.
-  if (!(await db.registerProspectM1(d1, { leadId, m1Sha: await prospectTextSha(text) }))) {
+  if (
+    !(await db.registerProspectM1(d1, {
+      leadId,
+      m1Sha: await prospectTextSha(text),
+      text,
+    }))
+  ) {
     // The echo can land between the read above and this write.
     return { ok: false, error: "already_enrolled" };
   }

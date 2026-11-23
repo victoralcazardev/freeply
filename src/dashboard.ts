@@ -6,7 +6,11 @@ export function esc(s: unknown): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    // Attribute values on the mobile page are double-quoted today, but a
+    // confirmation is single-quoted inside one of them: text from a lead must
+    // not be able to close either quote and end the attribute early.
+    .replace(/'/g, "&#39;");
 }
 
 export type Tab = "overview" | "campaigns" | "links" | "settings";

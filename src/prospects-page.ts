@@ -33,6 +33,7 @@ h2 { margin-top: 1.8rem; }
 .preview { white-space: pre-wrap; overflow-wrap: anywhere; margin: .4rem 0 0; }
 .offscreen { position: fixed; top: -1000px; left: 0; width: 1px; height: 1px; opacity: 0; }
 .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .6rem; }
+[data-copy-state]:empty { display: none; } /* a clipboard line only once it has something to say */
 .actions > * { flex: 1 1 9rem; }
 .actions > a { display: flex; }
 .actions button { width: 100%; padding: .6rem .9rem; }
@@ -102,7 +103,17 @@ const DECISIONS: Record<
   },
 };
 
-const redirect = (to: string) => new Response(null, { status: 302, headers: { location: to } });
+/**
+ * Every answer to a form on this page, and always a `303` to a `GET`.
+ *
+ * The page reloads itself when the phone comes back from Instagram (see
+ * `REFRESH_SCRIPT`), so a POST answered with markup would be posted again by
+ * the refresh: a copy would re-register, a close would re-close, an approval
+ * would re-approve. Ending in a `GET` makes the reload read the same thing
+ * without writing anything, and `303` says so in the one way a phone browser
+ * never re-sends.
+ */
+const redirect = (to: string) => new Response(null, { status: 303, headers: { location: to } });
 const problem = (message: string) => redirect(`/prospects?error=${encodeURIComponent(message)}`);
 
 /** What the two manual follow-up marks say when they land (T19). */
@@ -134,14 +145,14 @@ export async function handleProspectsPage(
   env: Env,
   url: URL,
 ): Promise<Response> {
-  if (url.pathname === "/prospects" && request.method === "GET") return render(env, url, {});
+  if (url.pathname === "/prospects" && request.method === "GET") return render(env, url);
   if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
 
   const form = await request.formData();
   const field = (name: string) => String(form.get(name) ?? "").trim();
 
   if (url.pathname === "/prospects/m1") {
-    return copyM1(env, url, field("lead_id"), String(form.get("text") ?? "").trim());
+    return copyM1(env, field("lead_id"), String(form.get("text") ?? "").trim());
   }
   if (url.pathname === "/prospects/m1/retry") return retryM1(env, field("lead_id"));
   if (url.pathname === "/prospects/drafts") {
@@ -156,20 +167,18 @@ export async function handleProspectsPage(
   return new Response("not found", { status: 404 });
 }
 
-async function render(
-  env: Env,
-  url: URL,
-  extra: { copied?: CopiedM1; status?: string; error?: string },
-): Promise<Response> {
+async function render(env: Env, url: URL): Promise<Response> {
   const now = Date.now();
-  const [m1, followups, drafts, manual, work] = await Promise.all([
+  const [m1, followups, drafts, manual, work, justCopied] = await Promise.all([
     db.prospectM1Queue(env.DB, now),
     db.prospectFollowupQueue(env.DB, now),
     db.prospectDraftQueue(env.DB, now),
     db.prospectManualQueue(env.DB, now),
     db.prospectWork(env.DB, OVERDUE_LIMIT),
+    // `?copied=` is the lead the copy just registered. It is a read, so the
+    // refresh that reloads this URL writes nothing and copies nothing again.
+    db.prospectCopiedM1(env.DB, url.searchParams.get("copied") ?? ""),
   ]);
-  const justCopied = extra.copied ?? null;
   // A lead who wrote and has no draft yet is the CLI's work — until the wait
   // gets long enough that a person has to watch it. From twenty hours it shows
   // in Manual as a warning, and past twenty-four as something only the app can
@@ -189,25 +198,27 @@ async function render(
     manual,
     overdue,
     justCopied,
-    status: extra.status ?? url.searchParams.get("status") ?? undefined,
-    error: extra.error ?? url.searchParams.get("error") ?? undefined,
+    status: url.searchParams.get("status") ?? undefined,
+    error: url.searchParams.get("error") ?? undefined,
   });
 }
 
 /**
- * "Copiar" on the send queue: register the final text, then let the browser copy
- * it. The order is the whole point — registering is what makes the echo legible,
- * and copying first would leave a message nobody can recognise.
+ * "Copiar" on the send queue: register the final text, then show the notice the
+ * browser copies from.
+ *
+ * Registering is the whole point — it is what makes the echo legible — and the
+ * clipboard write itself happens in the tap, before this request: a write after
+ * the redirect has no user gesture behind it, which iOS refuses. What the notice
+ * does is report what the copy resolved to, from what the tap recorded.
  */
-async function copyM1(env: Env, url: URL, leadId: string, text: string): Promise<Response> {
+async function copyM1(env: Env, leadId: string, text: string): Promise<Response> {
   if (!text) return problem("El mensaje está vacío.");
 
   const result = await registerExpectedM1(env.DB, leadId, text);
   if (!result.ok) return problem(M1_ERRORS[result.error]);
 
-  return render(env, url, {
-    copied: { leadId, handle: result.thread.handle, name: result.thread.name, text },
-  });
+  return redirect(`/prospects?copied=${encodeURIComponent(leadId)}`);
 }
 
 /** What the page says after an approval, by what the send came back with. */
@@ -374,8 +385,7 @@ export function prospectsPage(d: ProspectsPageData): Response {
         ${
           d.followups.length === 0
             ? empty("Ningún hilo esperando seguimiento.")
-            : d.followups.map((item, i) => followupCard(item, i)).join("") +
-              (d.followups.some((i) => i.step === "dm") ? COPY_SCRIPT : "")
+            : d.followups.map((item, i) => followupCard(item, i)).join("")
         }
       </section>
 
@@ -397,6 +407,7 @@ export function prospectsPage(d: ProspectsPageData): Response {
             : d.manual.map((item) => manualCard(item, d.now)).join("")
         }
       </section>
+      ${COPY_SCRIPT}
       ${REFRESH_SCRIPT}`,
   });
 }
@@ -463,14 +474,15 @@ function m1Card(item: db.ProspectM1Item, now: number, i: number): string {
       <label for="m1-text-${i}">Mensaje <span class="muted">— edítalo antes de copiar</span></label>
       <textarea id="m1-text-${i}" name="text" rows="5">${esc(text ?? "")}</textarea>
       <div class="actions">
-        <button class="primary" type="submit">Copiar y registrar</button>
+        <button class="primary" type="submit" data-copy-submit="m1-text-${i}">Copiar y registrar</button>
         <a href="${esc(chatUrl(thread.handle))}" target="_blank" rel="noopener">
           <button type="button">Abrir chat</button>
         </a>
       </div>
     </form>
-    <p class="small muted">«Copiar» registra el texto y luego lo copia: el hilo se reconoce solo
-      cuando llega el eco de ese texto exacto. Si lo cambias después, vuelve a copiarlo.</p>
+    <p class="small muted">«Copiar» copia este texto en el mismo toque y lo registra: el hilo se
+      reconoce solo cuando llega el eco de ese texto exacto. Si lo cambias después, vuelve a
+      copiarlo.</p>
     ${closeButton(thread.leadId)}
   </div>`;
 }
@@ -559,6 +571,7 @@ function followupCard(item: db.ProspectFollowupItem, i: number): string {
       el móvil. No repite el M1.</p>
     <label for="followup-text-${i}">Mensaje <span class="muted">— solo para copiarlo</span></label>
     <textarea id="followup-text-${i}" rows="4"></textarea>
+    <p class="small muted" data-copy-state></p>
     <div class="actions">
       <button type="button" data-copy="followup-text-${i}">Copiar</button>
       <a href="${esc(chatUrl(thread.handle))}" target="_blank" rel="noopener">
@@ -577,26 +590,70 @@ function followupCard(item: db.ProspectFollowupItem, i: number): string {
 }
 
 /**
- * Wires every "Copiar" of the follow-up queue to its own box, once per page.
+ * The only JavaScript on this page: every "Copiar" in it, once per page.
  *
- * The box is read at click time and nothing is registered: a follow-up DM is
- * already on a thread the echo enrolled, so there is no hash to store and no
- * echo to wait for.
+ * Two gestures, one rule — the clipboard is only ever claimed after the write
+ * resolved, and when it does not resolve the box is put in front of the person
+ * to long-press instead. The two differ in where the gesture happens:
+ *
+ * - "Copiar y registrar" copies the M1 box inside the tap and only then submits,
+ *   recording the outcome for the page it lands on. Copying after the redirect
+ *   is exactly the case iOS refuses: no user gesture, no clipboard.
+ * - "Copiar" on a follow-up DM has nothing to register — the thread is already
+ *   enrolled — so it copies in place and says so under the box.
+ *
+ * Nothing here writes to the server, and no message text is interpolated into
+ * JavaScript: the boxes are read at click time.
  */
 const COPY_SCRIPT = `<script>
     (function () {
-      var buttons = document.querySelectorAll("[data-copy]");
-      for (var i = 0; i < buttons.length; i++) {
-        buttons[i].addEventListener("click", function () {
+      function remember(key, value) {
+        try { sessionStorage.setItem(key, value); } catch (e) {}
+      }
+      var submits = document.querySelectorAll("[data-copy-submit]");
+      for (var i = 0; i < submits.length; i++) {
+        submits[i].addEventListener("click", function (event) {
+          var box = document.getElementById(this.getAttribute("data-copy-submit"));
+          var form = this.form;
+          if (!box || !form) return;
+          var lead = form.elements.namedItem("lead_id");
+          var key = "m1-copy:" + (lead ? lead.value : "");
+          event.preventDefault();
+          function send() { form.submit(); }
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(box.value).then(function () {
+              remember(key, "ok");
+              send();
+            }, function () {
+              remember(key, "fail");
+              send();
+            });
+            return;
+          }
+          send();
+        });
+      }
+
+      function noteOf(button) {
+        var card = button.closest ? button.closest(".card") : null;
+        return card ? card.querySelector("[data-copy-state]") : null;
+      }
+      var copies = document.querySelectorAll("[data-copy]");
+      for (var j = 0; j < copies.length; j++) {
+        copies[j].addEventListener("click", function () {
           var box = document.getElementById(this.getAttribute("data-copy"));
           if (!box) return;
+          var note = noteOf(this);
           box.focus();
           box.select();
+          function copied() { if (note) note.textContent = "En el portapapeles"; }
+          function manual() { if (note) note.textContent = "Mantén pulsado el texto para copiarlo"; }
           if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(box.value).catch(function () {});
-          } else {
-            try { document.execCommand("copy"); } catch (e) {}
+            navigator.clipboard.writeText(box.value).then(copied, manual);
+            return;
           }
+          try { if (document.execCommand("copy")) return copied(); } catch (e) {}
+          manual();
         });
       }
     })();
@@ -728,12 +785,14 @@ function copiedNotice(c: CopiedM1): string {
   return `<div class="card" style="border-color:var(--ok)">
     <div class="row">
       <h3>Copiado${c.name ? ` para ${esc(c.name)}` : ""} — @${esc(c.handle)}</h3>
-      <span class="tag">En el portapapeles</span>
+      <span><span class="tag" id="m1-copy-state" hidden>En el portapapeles</span><span
+        class="tag warn" id="m1-copy-hint">Mantén pulsado el texto para copiarlo</span></span>
     </div>
     <p class="small muted" style="margin:.15rem 0 .5rem">El texto ya está registrado. Abre el
       chat y pégalo: el hilo se reconoce cuando llegue el eco de este texto exacto. El siguiente lead
       está en «M1 por enviar», arriba; este hilo queda en «Copiados, esperando confirmación»,
-      al final.</p>
+      al final. Si el móvil no ha dejado copiarlo, mantén pulsado el texto de abajo y
+      «Pegar».</p>
     <details><summary class="small muted">Ver el texto copiado</summary>
       <pre class="preview">${esc(c.text)}</pre>
     </details>
@@ -742,19 +801,38 @@ function copiedNotice(c: CopiedM1): string {
         <button class="primary" type="button">Abrir chat con @${esc(c.handle)}</button>
       </a>
     </div>
-    <textarea id="m1-copy" readonly class="offscreen">${esc(c.text)}</textarea>
+    <textarea id="m1-copy" readonly class="offscreen"
+      data-copy-key="m1-copy:${esc(c.leadId)}">${esc(c.text)}</textarea>
   </div>
   <script>
     (function () {
       var box = document.getElementById("m1-copy");
-      if (!box) return;
-      if (box.focus) box.focus({ preventScroll: true });
-      box.select();
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(box.value).catch(function () {});
-      } else {
-        try { document.execCommand("copy"); } catch (e) {}
+      var tag = document.getElementById("m1-copy-state");
+      var hint = document.getElementById("m1-copy-hint");
+      if (!box || !tag || !hint) return;
+      function copied() { tag.hidden = false; hint.hidden = true; }
+      function manual() {
+        box.classList.remove("offscreen");
+        if (box.focus) box.focus({ preventScroll: true });
+        box.select();
+        tag.hidden = true;
+        hint.hidden = false;
       }
+      // The key is read from the DOM, not interpolated into this script: a lead
+      // id is opaque to this page and must never become JavaScript source.
+      var key = box.getAttribute("data-copy-key") || "";
+      var state = null;
+      try { state = sessionStorage.getItem(key); sessionStorage.removeItem(key); } catch (e) {}
+      if (state === "ok") return copied();
+      if (state === "fail") return manual();
+      // A reload, a bookmark, or a phone that restored the page: no tap to lean
+      // on, so the copy is attempted once and only claimed if it resolves.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(box.value).then(copied, manual);
+        return;
+      }
+      try { if (document.execCommand("copy")) return copied(); } catch (e) {}
+      manual();
     })();
   </script>`;
 }

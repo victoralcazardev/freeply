@@ -417,11 +417,22 @@ thread with no inbound message is in the page's `Seguimientos` queue, and the da
 counted from `enrolled_at` — the M1 echo's own timestamp, written when the echo enrolls
 the thread (the migration backfills it for the threads that enrolled earlier). From day 3
 the queue offers a touch without a DM (comment on a post or reply to a story); from day 7
-the touch is replaced by one short follow-up DM, written and sent by hand from the phone
-and only copied by the page; at day 14 with still no inbound the scheduled job closes the
-thread (`state: closed`, `close_reason: no_reply`). `touch_done_at` (button `Hecho`) and
-`followup_sent_at` (button `Enviado`) are the marks, one per step, and both are in the
-export. Nothing on this path sends by API or autopilot: a second unprompted DM is what
+one short follow-up DM, written and sent by hand from the phone and only copied by the
+page, is added **beside** the touch and not instead of it: an unmarked touch stays in the
+queue until it is marked or the thread closes, so a step somebody still owes is never
+taken away by the next one. Each step stops being due when its own mark is set, and each
+mark is refused before its own day — `Hecho` before day 3, `Enviado` before day 7 — so a
+mark cannot record a step that could not have happened yet. `touch_done_at` and
+`followup_sent_at` are those marks, and both are in the export.
+
+At fourteen days of silence the scheduled job closes the thread (`state: closed`,
+`close_reason: no_reply`). Two ways to be silent, one reason: no inbound since the M1
+echo, and a lead who answered at least once and then left — that one is counted from the
+last message in the thread, so a reply of ours from yesterday keeps it open and a thread
+nobody has said anything in for fourteen days closes. Closing this way is the same act as
+the page's, minus the person: working `waiting`/`approved` drafts are invalidated in the
+same batch and their queued retries are dropped, so a closed thread has nothing sendable
+behind it. Nothing on this path sends by API or autopilot: a second unprompted DM is what
 gets an account restricted. An inbound from the lead at any moment takes the thread out
 of the queue, and a mark that arrives after that is refused rather than overwriting it.
 
@@ -440,11 +451,28 @@ clipboard and in any preview (`white-space: pre-wrap`); registration still compa
 normalized text, so an echo with the same line breaks or with them collapsed to spaces
 enrolls the same thread.
 
+**No form on `/prospects` is ever re-posted by that reload.** Every queue `POST` answers
+`303` to a `GET`: `Copiar` lands on `/prospects?copied=<lead_id>` (the notice and the exact
+registered text, read from `m1_copied_text`), and the other buttons land on
+`/prospects?status=…` or `?error=…`. Coming back from Instagram therefore re-reads the
+same page instead of re-registering a copy, re-closing a thread or re-approving a draft.
+
+**The clipboard is claimed only when it actually received the text.** `Copiar` on an M1
+writes to the clipboard inside the tap, before submitting: a copy after the redirect has
+no user gesture behind it, which iOS refuses, and that refusal used to be swallowed while
+the page still said «En el portapapeles». Now the outcome travels with the tap and the
+notice shows «En el portapapeles» only after `navigator.clipboard.writeText` resolved;
+otherwise it says «Mantén pulsado el texto para copiarlo» and brings the readonly box on
+screen, selected, for the long press. The follow-up DM's `Copiar` does the same under its
+own box. Reloading the notice re-attempts the copy once and only claims it if it resolves.
+
 **Any thread card can be closed by hand.** `No le interesa` posts `reason: no_interesa`
 behind a browser confirm and the dashboard session, the same route the JSON API exposes;
 it is valid for a thread the webhook never enrolled, which is the case the first real "no
 me interesa" exposed. Closing is permanent: it invalidates the thread's pending drafts,
-drops their queued retries, and refuses to arm the M1 again (`thread_closed`).
+drops their queued retries, and refuses to arm the M1 again (`thread_closed`). The
+scheduled fourteen-day close keeps the same invariant from the other side: a send refused
+on a closed thread retires its draft instead of putting it back in `waiting`.
 
 **How proven it is.** The echo enrollment was observed against live Meta (a DM sent from
 the phone came back with the recipient's IGSID). The rest of this flow — the API, the page,

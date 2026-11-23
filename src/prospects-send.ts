@@ -292,6 +292,24 @@ function statusAfterBlock(code: ProspectBlockCode): db.ProspectDraftStatus {
 }
 
 /**
+ * What an attempt may leave a draft as, given the thread it belongs to.
+ *
+ * A refusal leaves the draft where it was so it can be retried once whatever
+ * blocked it is gone — except on a closed thread, where nothing can ever send it
+ * again. There `waiting` would put a message nobody can deliver back in front of
+ * the operator, so the draft is retired instead.
+ */
+async function sendableStatus(
+  d1: D1Database,
+  leadId: string,
+  status: db.ProspectDraftStatus,
+): Promise<db.ProspectDraftStatus> {
+  if (status !== "waiting") return status;
+  const thread = await db.getProspectThread(d1, leadId);
+  return thread === null || thread.state === "closed" ? "invalidated" : status;
+}
+
+/**
  * Records what a send attempt left the draft as.
  *
  * One writer for every outcome, so a blocked approval, a Meta refusal and a
@@ -308,16 +326,18 @@ export async function setProspectDraftStatus(
   const draft = await db.getProspectDraft(d1, draftId);
   if (!draft) return false;
 
+  const target = await sendableStatus(d1, draft.leadId, status);
+
   return db.decideProspectDraft(d1, {
     draftId,
     // `send_state_unknown` is deliberately not a starting point: it means a
     // request may have reached Meta, and only a person looking at the thread may
     // say otherwise ("salió" / "no salió"). No check, retry or cron gets to
     // quietly turn it back into something sendable.
-    from: (["waiting", "approved"] as const).filter((s) => s !== status),
-    status,
+    from: (["waiting", "approved"] as const).filter((s) => s !== target),
+    status: target,
     decidedText: draft.decidedText,
-    decidedAt: status === "waiting" ? null : (draft.decidedAt ?? now),
+    decidedAt: target === "waiting" ? null : (draft.decidedAt ?? now),
   });
 }
 

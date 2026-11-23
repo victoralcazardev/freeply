@@ -484,10 +484,11 @@ describe("GET /prospects", () => {
 
     // Copiying one takes it out of the queue and puts it in the collapsed
     // section; the next uncopied lead is the first card that remains.
-    const copied = await postPage("/prospects/m1", {
+    const posted = await postPage("/prospects/m1", {
       lead_id: "lead-c",
       text: "Hola, lead-c.",
     });
+    const copied = await getPage(posted.location ?? "");
     const after = section(copied.html, "m1-por-enviar");
     expect(after).not.toContain(`@${handleFor("lead-c")}`);
     expect(after.indexOf(`@${handleFor("lead-b")}`)).toBeLessThan(
@@ -509,8 +510,9 @@ describe("GET /prospects", () => {
     const page = await getPage("/prospects");
     expect(section(page.html, "m1-por-enviar")).toContain(`>${text}</textarea>`);
 
-    const copied = await postPage("/prospects/m1", { lead_id: "lead-lines", text });
-    expect(copied.status).toBe(200);
+    const posted = await postPage("/prospects/m1", { lead_id: "lead-lines", text });
+    expect(posted.status).toBe(303);
+    const copied = await getPage(posted.location ?? "");
     // The clipboard box and the preview both keep the newlines; the CSS keeps
     // the preview's line breaks visible.
     expect(copied.html).toContain(`id="m1-copy"`);
@@ -630,12 +632,15 @@ describe("GET /prospects", () => {
 });
 
 describe("POST /prospects/m1", () => {
-  it("registers the edited text and copies exactly that text", async () => {
+  it("registers the edited text and answers with a GET that carries it", async () => {
     await pendingLead({ leadId: "lead-1", m1Draft: "Hola, Ana. Soy Víctor." });
     const edited = "Hola, Ana. Soy Víctor, de Madrid.";
 
     const response = await postPage("/prospects/m1", { lead_id: "lead-1", text: edited });
-    expect(response.status).toBe(200);
+    // Ending in a GET is what makes coming back from Instagram harmless: the
+    // reload re-reads the notice instead of posting the copy a second time.
+    expect(response.status).toBe(303);
+    expect(response.location).toBe("/prospects?copied=lead-1");
 
     // The hash is what recognises the echo, and it is of the edited text.
     const thread = await threadRow("lead-1");
@@ -644,22 +649,63 @@ describe("POST /prospects/m1", () => {
     expect(thread.m1_registered_at).toBeGreaterThan(0);
     expect(thread.m1_registered_at).toBeLessThanOrEqual(Date.now());
 
-    // What lands in the clipboard is the registered text, not the draft's.
-    expect(response.html).toContain('id="m1-copy"');
-    expect(response.html).toContain(`>${edited}</textarea>`);
-    expect(response.html).toContain("navigator.clipboard.writeText");
-    expect(response.html).toContain(`https://ig.me/m/${handleFor("lead-1")}`);
+    // The notice, and the text the clipboard gets, live on the page the redirect
+    // points at: reading it again is reading, never a second registration.
+    const notice = await getPage(response.location ?? "");
+    expect(notice.status).toBe(200);
+    expect(notice.html).toContain('id="m1-copy"');
+    expect(notice.html).toContain(`>${edited}</textarea>`);
+    expect(notice.html).toContain(`https://ig.me/m/${handleFor("lead-1")}`);
+    expect(notice.html).toContain("siguiente lead");
+    expect(section(notice.html, "m1-por-enviar")).not.toContain(`@${handleFor("lead-1")}`);
+
+    // A reload of that same URL writes nothing: the registration moment is the
+    // one the POST made, and no message row is invented by a GET.
+    const messagesBefore = await messageCount();
+    const again = await getPage(response.location ?? "");
+    expect(again.html).toContain(`>${edited}</textarea>`);
+    expect((await threadRow("lead-1")).m1_registered_at).toBe(thread.m1_registered_at);
+    expect(await messageCount()).toBe(messagesBefore);
 
     // The copied card is gone from the top immediately; coming back to the page
     // later it is still waiting for its echo, in the collapsed section.
-    expect(response.html).toContain("siguiente lead");
-    expect(section(response.html, "m1-por-enviar")).not.toContain(
-      `@${handleFor("lead-1")}`,
-    );
     const later = await getPage("/prospects");
     expect(section(later.html, "m1-por-enviar")).not.toContain(`@${handleFor("lead-1")}`);
     expect(section(later.html, "m1-copiados")).toContain(`@${handleFor("lead-1")}`);
     expect(section(later.html, "m1-copiados")).toContain("Copiado hace");
+  });
+
+  it("copies inside the tap and only claims the clipboard once the write resolved", async () => {
+    await pendingLead({ leadId: "lead-1", m1Draft: "Hola, Ana. Soy Víctor." });
+    const edited = "Hola, Ana. Soy Víctor, de Madrid.";
+
+    // The box the operator reads is the one copied, inside the click: a copy
+    // after the redirect has no user gesture behind it, and iOS refuses it.
+    const page = await getPage("/prospects");
+    expect(section(page.html, "m1-por-enviar")).toContain('data-copy-submit="m1-text-0"');
+    expect(page.html).toContain("preventDefault()");
+    expect(page.html).toContain("form.submit()");
+    expect(page.html).toContain('remember(key, "ok")');
+    expect(page.html).toContain('remember(key, "fail")');
+    expect(page.html).toContain("sessionStorage.setItem(key, value)");
+
+    const copied = await postPage("/prospects/m1", { lead_id: "lead-1", text: edited });
+    const notice = await getPage(copied.location ?? "");
+    // Nothing claims the clipboard up front: the tag starts hidden and the
+    // honest fallback is the one on screen until a write resolves.
+    expect(notice.html).toContain('id="m1-copy-state" hidden>En el portapapeles');
+    expect(notice.html).toContain(
+      'id="m1-copy-hint">Mantén pulsado el texto para copiarlo',
+    );
+    expect(notice.html).toContain("navigator.clipboard.writeText(box.value).then(copied, manual)");
+    // A rejected write brings the readonly box on screen and selects it, so the
+    // long press the hint asks for has something to land on.
+    expect(notice.html).toContain('box.classList.remove("offscreen")');
+    expect(notice.html).toContain("box.select()");
+    expect(notice.html).toContain('<textarea id="m1-copy" readonly class="offscreen"');
+    // The lead id reaches the script as data, never as source.
+    expect(notice.html).toContain('data-copy-key="m1-copy:lead-1"');
+    expect(notice.html).toContain('box.getAttribute("data-copy-key")');
   });
 
   it("refuses to re-arm an enrolled thread and to register an empty message", async () => {
@@ -675,14 +721,14 @@ describe("POST /prospects/m1", () => {
       lead_id: "lead-1",
       text: "Otro texto",
     });
-    expect(enrolledResponse.status).toBe(302);
+    expect(enrolledResponse.status).toBe(303);
     expect(decodeURIComponent(enrolledResponse.location ?? "")).toContain(
       "Este hilo ya está registrado",
     );
     expect((await threadRow("lead-1")).m1_sha).toBe(before);
 
     const emptyResponse = await postPage("/prospects/m1", { lead_id: "lead-1", text: "   " });
-    expect(emptyResponse.status).toBe(302);
+    expect(emptyResponse.status).toBe(303);
     expect(decodeURIComponent(emptyResponse.location ?? "")).toContain("vacío");
   });
 });
@@ -700,7 +746,7 @@ describe("POST /prospects/m1/retry", () => {
     expect((await getPage("/prospects")).html).toContain('action="/prospects/m1/retry"');
 
     const response = await postPage("/prospects/m1/retry", { lead_id: "lead-1" });
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
     expect(response.location).toContain("/prospects");
 
     const thread = await threadRow("lead-1");
@@ -787,7 +833,7 @@ describe("POST /prospects/close", () => {
         lead_id: leadId,
         reason: "no_interesa",
       });
-      expect(response.status).toBe(302);
+      expect(response.status).toBe(303);
       expect(decodeURIComponent(response.location ?? "")).toContain("Hilo cerrado");
 
       const thread = await threadRow(leadId);
@@ -858,7 +904,7 @@ describe("POST /prospects/drafts", () => {
       action: "approve",
       text: edited,
     });
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
     expect(decodeURIComponent(response.location ?? "")).toContain("enviado");
 
     // Approving is the send (T7): the operator's text is what reaches the lead.
@@ -885,7 +931,7 @@ describe("POST /prospects/drafts", () => {
     await pushDraft({ draftId: "draft-1", leadId: "lead-1", text: "Gracias por responder." });
 
     const response = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "skip" });
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
 
     const draft = await draftRow("draft-1");
     expect(draft.status).toBe("skipped");
@@ -913,7 +959,7 @@ describe("POST /prospects/drafts", () => {
         .run();
 
       const response = await postPage("/prospects/drafts", { draft_id: draftId, action });
-      expect(response.status).toBe(302);
+      expect(response.status).toBe(303);
       expect((await draftRow(draftId)).status).toBe(expected);
     }
   });
@@ -930,7 +976,7 @@ describe("POST /prospects/drafts", () => {
     await pushDraft({ draftId: "draft-1", leadId: "lead-1", text: "Perdona la tardanza." });
 
     const response = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "sent" });
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
     expect((await draftRow("draft-1")).status).toBe("sent");
 
     // Nothing waiting is left in either queue.
@@ -958,7 +1004,7 @@ describe("POST /prospects/drafts", () => {
       action: "approve",
       text: "Te cuento.",
     });
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
     expect(decodeURIComponent(response.location ?? "")).toContain("ya no está pendiente");
     expect((await draftRow("draft-1")).status).toBe("skipped");
   });

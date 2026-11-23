@@ -24,7 +24,8 @@ import { FIXTURE_SECRETS, IG_USER_ID } from "../fixtures";
 const TOKEN = "test-api-token";
 const apiEnv = { ...env, API_TOKEN: TOKEN };
 
-const HOUR = 60 * 60 * 1000;
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
 
 /** The job the Worker hands the outbox for a prospect reply. */
 function job(draftId: string, over: Partial<SendJob> = {}): SendJob {
@@ -356,6 +357,21 @@ async function fireT7Retry() {
   });
 }
 
+/** The every-fifteen-minutes trigger, as wrangler.jsonc sets it. */
+const CRON = "*/15 * * * *";
+
+/** The deployment's scheduled pass, including the follow-up close (T19). */
+async function runScheduled(): Promise<void> {
+  await worker.scheduled(
+    {
+      cron: CRON,
+      scheduledTime: Date.now(),
+      noRetry: () => {},
+    } as unknown as ScheduledController,
+    env,
+  );
+}
+
 /** The error the page redirected with, decoded. */
 const said = (location: string | null) => decodeURIComponent(location ?? "");
 
@@ -393,7 +409,7 @@ describe("approving a draft sends it inside the window", () => {
     stubMeta(() => ok("mid_api_1"));
 
     const response = await approve("draft-1", "Gracias por responder, Ana.");
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
     expect(said(response.location)).toContain("Aprobado y enviado");
 
     // Exactly one call, addressed to the peer Meta gave us, with the text the
@@ -434,9 +450,9 @@ describe("approving a draft sends it inside the window", () => {
     await pushDraft({});
     stubMeta(() => ok("mid_api_1"));
 
-    expect((await approve("draft-1", "Gracias por responder.")).status).toBe(302);
+    expect((await approve("draft-1", "Gracias por responder.")).status).toBe(303);
     const second = await approve("draft-1", "Gracias por responder.");
-    expect(second.status).toBe(302);
+    expect(second.status).toBe(303);
     expect(said(second.location)).toContain("ya no está pendiente");
 
     expect(calls).toHaveLength(1);
@@ -458,7 +474,10 @@ describe("the five checks, each with its code", () => {
     expect(said(response.location)).toContain("not_registered");
     expect(said(response.location)).toContain("registrado");
     expect(calls).toEqual([]);
-    expect((await draftRow("draft-1")).status).toBe("waiting");
+    // A refusal that would leave the draft "waiting" retires it instead when
+    // the thread is closed: nothing can send it, and a waiting draft of a closed
+    // thread is exactly what keeps showing up in the queues.
+    expect((await draftRow("draft-1")).status).toBe("invalidated");
   });
 
   it("blocks with window_closed a day after the lead's last message", async () => {
@@ -841,6 +860,43 @@ describe("a settled outcome is never sent again", () => {
   });
 });
 
+describe("the day-14 close", () => {
+  it("drops the queued retry of a thread it retires", async () => {
+    const now = Date.now();
+    await lead({ echoAt: now - 30 * MINUTE, reply: "Cuéntame más", replyAt: now - 10 * MINUTE });
+    await pushDraft({});
+    // A retry queued behind a definitive refusal: the draft is not sent, and its
+    // row waits in the outbox for the next alarm.
+    stubMeta(() => refusal(400, 80007, "Rate limit exceeded"));
+    expect(said((await approve("draft-1", "Gracias por responder.")).location)).toContain(
+      "reintenta",
+    );
+    expect(await account().pendingCommentIds()).toContain("draft-1");
+
+    // The lead answered and then went silent: fifteen days later the scheduled
+    // pass closes the thread.
+    await env.DB.prepare(
+      `UPDATE prospect_threads SET last_inbound_at = ?, last_outbound_at = ?
+       WHERE lead_id = 'lead-1'`,
+    )
+      .bind(now - 15 * 24 * HOUR, now - 15 * 24 * HOUR)
+      .run();
+
+    stubMeta(() => ok());
+    await runScheduled();
+
+    expect((await threadRow("lead-1")).state).toBe("closed");
+    expect((await draftRow("draft-1")).status).toBe("invalidated");
+    // The retry behind it goes with the close: no alarm wakes up for a message
+    // that can never be sent again.
+    expect(await account().pendingCommentIds()).not.toContain("draft-1");
+
+    await fireT7Retry();
+    expect(calls).toEqual([]);
+    expect((await draftRow("draft-1")).status).toBe("invalidated");
+  });
+});
+
 describe("two approvals at once", () => {
   it("sends at most one message for the same draft", async () => {
     const now = Date.now();
@@ -852,8 +908,8 @@ describe("two approvals at once", () => {
       approve("draft-1", "Gracias por responder."),
       approve("draft-1", "Gracias por responder."),
     ]);
-    expect(a.status).toBe(302);
-    expect(b.status).toBe(302);
+    expect(a.status).toBe(303);
+    expect(b.status).toBe(303);
 
     expect(calls).toHaveLength(1);
     expect((await outbound("lead-1")).filter((m) => m.origin === "api")).toHaveLength(1);

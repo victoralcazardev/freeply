@@ -165,6 +165,21 @@ function section(html: string, id: string): string {
   return html.slice(start, end);
 }
 
+/**
+ * The cards of one lead in a slice of the page.
+ *
+ * A thread can be offered two steps at once once its follow-up DM is due, so
+ * "this lead has this step" has to be asked of its own card and not of the
+ * section: a shared script or a neighbour's card would answer either way.
+ */
+function cardsFor(html: string, handle: string): string[] {
+  return html
+    .split('<div class="card"')
+    .slice(1)
+    .map((card) => `<div class="card"${card}`)
+    .filter((card) => card.includes(`@${handle}`));
+}
+
 /** The exported thread — the public read of what the queue and the cron wrote. */
 async function exportedThread(leadId: string): Promise<any> {
   const r = await call("GET", "/api/prospects/export");
@@ -177,6 +192,27 @@ async function exportedThread(leadId: string): Promise<any> {
 async function exportedMessages(leadId: string): Promise<any[]> {
   const r = await call("GET", "/api/prospects/export");
   return r.json.messages.filter((m: any) => m.lead_id === leadId);
+}
+
+async function exportedDraft(draftId: string): Promise<any> {
+  const r = await call("GET", "/api/prospects/export");
+  const draft = r.json.drafts.find((d: any) => d.draft_id === draftId);
+  expect(draft, `draft ${draftId} not in export`).toBeDefined();
+  return draft;
+}
+
+/** Reconcile's Graph reads, answered with an empty page. */
+function stubMetaEmpty(): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ),
+  );
 }
 
 async function runScheduled(): Promise<void> {
@@ -283,7 +319,7 @@ describe("GET /prospects — Seguimientos", () => {
     expect(followups).not.toContain(`ig.me/m/${handleFor("lead-day3")}`);
   });
 
-  it("replaces the touch with the follow-up DM at day 7, and keeps it until day 14", async () => {
+  it("adds the follow-up DM at day 7 and keeps an untouched touch beside it", async () => {
     const now = Date.now();
     await enrolledLead({
       leadId: "lead-day6",
@@ -300,22 +336,79 @@ describe("GET /prospects — Seguimientos", () => {
     const { html } = await getPage();
     const followups = section(html, "seguimientos");
 
-    // Day 6 is still the touch: the next step has not arrived yet.
+    // Day 6 is still the touch alone: the DM step has not arrived yet.
+    expect(cardsFor(followups, handleFor("lead-day6"))).toHaveLength(1);
     expect(followups).toContain(`https://www.instagram.com/${handleFor("lead-day6")}/`);
     expect(followups).not.toContain(`ig.me/m/${handleFor("lead-day6")}`);
 
     for (const leadId of ["lead-day7", "lead-day13"]) {
       const handle = handleFor(leadId);
+      // Two steps at once: the DM is due and the touch was never marked, so
+      // neither step may be dropped on the way to the other.
+      const cards = cardsFor(followups, handle);
+      expect(cards).toHaveLength(2);
+
+      const dm = cards.find((card) => card.includes(`ig.me/m/${handle}`)) ?? "";
       // An editable, empty box: the follow-up is written by hand, not filled in.
-      expect(followups).toMatch(/<textarea id="followup-text-\d+"[^>]*><\/textarea>/);
-      expect(followups).toContain(`ig.me/m/${handle}`);
-      expect(followups).toContain("Copiar");
-      expect(followups).toContain("navigator.clipboard.writeText");
-      expect(followups).toContain('name="action" value="followup"');
-      expect(followups).toContain(">Enviado</button>");
-      // The touch was superseded, not repeated next to the DM step.
-      expect(followups).not.toContain(`https://www.instagram.com/${handle}/`);
+      expect(dm).toMatch(/<textarea id="followup-text-\d+"[^>]*><\/textarea>/);
+      expect(dm).toContain("data-copy=");
+      expect(dm).toContain("data-copy-state");
+      expect(dm).toContain("Copiar");
+      expect(dm).toContain('name="action" value="followup"');
+      expect(dm).toContain(">Enviado</button>");
+
+      const touch = cards.find((card) => card.includes(`https://www.instagram.com/${handle}/`)) ?? "";
+      expect(touch).toContain("Comenta una publicación suya o responde a una story.");
+      expect(touch).toContain('name="action" value="touch"');
+      expect(touch).toContain(">Hecho</button>");
+      expect(touch).not.toContain(`ig.me/m/${handle}`);
     }
+
+    // What lands in the clipboard is only claimed once the write resolved, and
+    // the DM box is the text that chain copies.
+    expect(html).toContain("navigator.clipboard.writeText");
+    expect(html).toContain("En el portapapeles");
+    expect(html).toContain("Mantén pulsado el texto para copiarlo");
+
+    // Marking the DM does not retire a touch that was never done.
+    await postPage("/prospects/followups", { lead_id: "lead-day7", action: "followup" });
+    const after = section((await getPage()).html, "seguimientos");
+    expect(cardsFor(after, handleFor("lead-day7"))).toHaveLength(1);
+    expect(after).toContain(`https://www.instagram.com/${handleFor("lead-day7")}/`);
+    expect(after).not.toContain(`ig.me/m/${handleFor("lead-day7")}`);
+
+    const touched = await postPage("/prospects/followups", {
+      lead_id: "lead-day7",
+      action: "touch",
+    });
+    expect(touched.status).toBe(303);
+    const thread = await exportedThread("lead-day7");
+    expect(thread.followup_sent_at).toBeGreaterThan(0);
+    expect(thread.touch_done_at).toBeGreaterThan(0);
+    expect(
+      cardsFor(section((await getPage()).html, "seguimientos"), handleFor("lead-day7")),
+    ).toHaveLength(0);
+  });
+
+  it("refuses each mark before its own day, so no step is marked early", async () => {
+    const now = Date.now();
+    await enrolledLead({ leadId: "lead-dos", peerId: "peer-dos", echoAt: now - 2 * DAY });
+    await enrolledLead({ leadId: "lead-seis", peerId: "peer-seis", echoAt: now - 6 * DAY });
+
+    // The touch is the day-3 step: before that there is nothing to have done.
+    const touch = await postPage("/prospects/followups", { lead_id: "lead-dos", action: "touch" });
+    expect(touch.status).toBe(303);
+    expect(decodeURIComponent(touch.location ?? "")).toContain("no está en la cola");
+    expect((await exportedThread("lead-dos")).touch_done_at).toBeNull();
+
+    // The DM is the day-7 step: marking it early would hide the touch instead.
+    const dm = await postPage("/prospects/followups", {
+      lead_id: "lead-seis",
+      action: "followup",
+    });
+    expect(dm.status).toBe(303);
+    expect(decodeURIComponent(dm.location ?? "")).toContain("no está en la cola");
+    expect((await exportedThread("lead-seis")).followup_sent_at).toBeNull();
   });
 
   it("drops the thread from the queue as soon as the lead writes back", async () => {
@@ -414,11 +507,12 @@ describe("POST /prospects/followups", () => {
       lead_id: "lead-touch",
       action: "touch",
     });
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
     expect(response.location).toContain("/prospects");
 
     const followups = section((await getPage()).html, "seguimientos");
     expect(followups).not.toContain(`@${handleFor("lead-touch")}`);
+    expect(cardsFor(followups, handleFor("lead-touch"))).toHaveLength(0);
 
     const after = await exportedThread("lead-touch");
     expect(after.touch_done_at).toBeGreaterThanOrEqual(now);
@@ -429,7 +523,7 @@ describe("POST /prospects/followups", () => {
       lead_id: "lead-touch",
       action: "touch",
     });
-    expect(again.status).toBe(302);
+    expect(again.status).toBe(303);
     expect(decodeURIComponent(again.location ?? "")).toContain("no está en la cola");
     expect((await exportedThread("lead-touch")).touch_done_at).toBe(after.touch_done_at);
   });
@@ -447,11 +541,15 @@ describe("POST /prospects/followups", () => {
       lead_id: "lead-dm",
       action: "followup",
     });
-    expect(response.status).toBe(302);
+    expect(response.status).toBe(303);
     expect(response.location).toContain("/prospects");
 
+    // The DM step is gone; the touch this thread never marked is not.
     const followups = section((await getPage()).html, "seguimientos");
-    expect(followups).not.toContain(`@${handleFor("lead-dm")}`);
+    const cards = cardsFor(followups, handleFor("lead-dm"));
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toContain('name="action" value="touch"');
+    expect(followups).not.toContain(`ig.me/m/${handleFor("lead-dm")}`);
     expect(followups).not.toContain("Copiar");
 
     const after = await exportedThread("lead-dm");
@@ -485,7 +583,7 @@ describe("POST /prospects/followups", () => {
       lead_id: "lead-refuse",
       action: "teleport",
     });
-    expect(unknown.status).toBe(302);
+    expect(unknown.status).toBe(303);
     expect(decodeURIComponent(unknown.location ?? "")).toContain("Acción desconocida");
     expect((await exportedThread("lead-refuse")).touch_done_at).toBeNull();
 
@@ -494,7 +592,7 @@ describe("POST /prospects/followups", () => {
       lead_id: "lead-refuse",
       action: "touch",
     });
-    expect(answered.status).toBe(302);
+    expect(answered.status).toBe(303);
     expect(decodeURIComponent(answered.location ?? "")).toContain("no está en la cola");
     expect((await exportedThread("lead-refuse")).touch_done_at).toBeNull();
   });
@@ -509,16 +607,7 @@ describe("the scheduled job", () => {
       inbound({ peerId: "peer-a", text: "Cuéntame más", mid: "mid_in_a", at: now - 10 * DAY }),
     );
 
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(JSON.stringify({ data: [] }), {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          }),
-      ),
-    );
+    stubMetaEmpty();
 
     expect((await exportedThread("lead-quiet")).state).toBe("enrolled");
     await runScheduled();
@@ -538,5 +627,66 @@ describe("the scheduled job", () => {
     const again = await exportedThread("lead-quiet");
     expect(again.state).toBe("closed");
     expect(again.updated_at).toBe(quiet.updated_at);
+  });
+
+  it("closes a thread the lead answered and then went silent, 14 days after that message", async () => {
+    const now = Date.now();
+    // Answered once, then nothing from either side for fifteen days.
+    await enrolledLead({ leadId: "lead-silent", peerId: "peer-s1", echoAt: now - 20 * DAY });
+    await deliver(
+      inbound({ peerId: "peer-s1", text: "Cuéntame más", mid: "mid_in_s1", at: now - 15 * DAY }),
+    );
+    // Same wait, but the last word is ours and it is two days old: the thread is
+    // still alive, and closing it would retire a conversation that just moved.
+    await enrolledLead({ leadId: "lead-ours", peerId: "peer-s2", echoAt: now - 20 * DAY });
+    await deliver(
+      inbound({ peerId: "peer-s2", text: "Cuéntame más", mid: "mid_in_s2", at: now - 15 * DAY }),
+    );
+    await deliver(
+      echo({ peerId: "peer-s2", text: "Te cuento.", mid: "mid_echo_s2", at: now - 2 * DAY }),
+    );
+    // The lead wrote three days ago: nobody is being ignored here.
+    await enrolledLead({ leadId: "lead-recent", peerId: "peer-s3", echoAt: now - 20 * DAY });
+    await deliver(
+      inbound({ peerId: "peer-s3", text: "Cuéntame más", mid: "mid_in_s3", at: now - 3 * DAY }),
+    );
+
+    stubMetaEmpty();
+    await runScheduled();
+
+    const silent = await exportedThread("lead-silent");
+    expect(silent.state).toBe("closed");
+    expect(silent.close_reason).toBe("no_reply");
+    expect(silent.last_inbound_at).toBe(now - 15 * DAY);
+
+    expect((await exportedThread("lead-ours")).state).toBe("enrolled");
+    expect((await exportedThread("lead-ours")).close_reason).toBeNull();
+    expect((await exportedThread("lead-recent")).state).toBe("enrolled");
+  });
+
+  it("retires the drafts of a thread it closes", async () => {
+    const now = Date.now();
+    await enrolledLead({ leadId: "lead-retire", peerId: "peer-r2", echoAt: now - 20 * DAY });
+    await deliver(
+      inbound({ peerId: "peer-r2", text: "Cuéntame más", mid: "mid_in_r2", at: now - 15 * DAY }),
+    );
+    const pushed = await call("POST", "/api/prospects/drafts", {
+      draft_id: "draft-retire",
+      lead_id: "lead-retire",
+      kind: "reply",
+      stage: "M2",
+      text: "Te cuento.",
+      base_version: 2,
+    });
+    expect(pushed.status).toBe(201);
+    expect((await exportedDraft("draft-retire")).status).toBe("waiting");
+
+    stubMetaEmpty();
+    await runScheduled();
+
+    expect((await exportedThread("lead-retire")).state).toBe("closed");
+    // A closed thread has nothing sendable behind it, the same as the close a
+    // person makes from the page.
+    expect((await exportedDraft("draft-retire")).status).toBe("invalidated");
   });
 });
