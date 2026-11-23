@@ -5,8 +5,14 @@ import { approveProspectDraft, registerExpectedM1 } from "./prospects";
 import type { ProspectBlockCode, ProspectSendOutcome } from "./prospects-send";
 
 /**
- * The mobile page for the daily sessions (S8): four queues over the threads the
+ * The mobile page for the daily sessions (S8): five queues over the threads the
  * M1 echo enrolled, and nothing else.
+ *
+ * One of them is the follow-up queue (T19) for a thread the lead never answered:
+ * a no-DM touch from day 3, one hand-sent DM from day 7, and a close at day 14
+ * that the scheduled job performs. Both steps are marked here and neither sends
+ * anything — the API and the autopilot have no path to a follow-up, because Meta
+ * gets a thread restricted for a second unprompted message.
  *
  * Every read here comes from `prospect_threads` by `lead_id`, so a conversation
  * nobody registered has no way onto this page (S11). No message text is ever
@@ -96,6 +102,16 @@ const DECISIONS: Record<
 const redirect = (to: string) => new Response(null, { status: 302, headers: { location: to } });
 const problem = (message: string) => redirect(`/prospects?error=${encodeURIComponent(message)}`);
 
+/** What the two manual follow-up marks say when they land (T19). */
+const FOLLOWUP_DONE: Record<string, string> = {
+  touch:
+    "Toque marcado. No se ha enviado ningún mensaje: el siguiente paso es el DM de seguimiento.",
+  followup:
+    "DM de seguimiento marcado. El hilo se cierra solo si al día 14 sigue sin respuesta.",
+};
+
+const FOLLOWUP_REFUSED = "Ese hilo no está en la cola de seguimientos.";
+
 export interface CopiedM1 {
   leadId: string;
   handle: string;
@@ -122,6 +138,9 @@ export async function handleProspectsPage(
   if (url.pathname === "/prospects/drafts") {
     return decideDraft(env, field("draft_id"), field("action"), String(form.get("text") ?? ""));
   }
+  if (url.pathname === "/prospects/followups") {
+    return markFollowup(env, field("lead_id"), field("action"));
+  }
   return new Response("not found", { status: 404 });
 }
 
@@ -131,8 +150,9 @@ async function render(
   extra: { copied?: CopiedM1; status?: string; error?: string },
 ): Promise<Response> {
   const now = Date.now();
-  const [m1, drafts, manual, work] = await Promise.all([
+  const [m1, followups, drafts, manual, work] = await Promise.all([
     db.prospectM1Queue(env.DB, now),
+    db.prospectFollowupQueue(env.DB, now),
     db.prospectDraftQueue(env.DB, now),
     db.prospectManualQueue(env.DB, now),
     db.prospectWork(env.DB, OVERDUE_LIMIT),
@@ -151,6 +171,7 @@ async function render(
     // otherwise fall back to the CLI's draft, which is not what was sent.
     pending: copied ? m1.pending.filter((i) => i.thread.leadId !== copied.leadId) : m1.pending,
     unconfirmed: m1.unconfirmed,
+    followups,
     drafts,
     manual,
     overdue,
@@ -184,6 +205,30 @@ function sendSaid(send: ProspectSendOutcome): Response {
   if (send.status === "blocked") return problem(SEND_BLOCKED[send.code]);
   if (send.status === "send_state_unknown") return problem(SEND_UNKNOWN);
   return problem(SEND_FAILED);
+}
+
+/**
+ * "Hecho" and "Enviado" on the follow-up queue (T19).
+ *
+ * Neither sends anything and neither stores what was typed: the DM is written
+ * and copied on the phone, and this only records that the step happened. The
+ * write itself is conditional on the thread still being in the queue, so a
+ * mark that arrives after the lead answered is refused instead of overwriting
+ * a conversation that moved on.
+ */
+async function markFollowup(env: Env, leadId: string, action: string): Promise<Response> {
+  const mark =
+    action === "touch"
+      ? db.markProspectTouchDone
+      : action === "followup"
+        ? db.markProspectFollowupSent
+        : null;
+  if (!mark) return problem("Acción desconocida.");
+
+  if (leadId === "" || !(await mark(env.DB, leadId, Date.now()))) {
+    return problem(FOLLOWUP_REFUSED);
+  }
+  return redirect(`/prospects?status=${encodeURIComponent(FOLLOWUP_DONE[action])}`);
 }
 
 /** "Reintentar": back to the send queue with nothing registered. */
@@ -233,6 +278,8 @@ export interface ProspectsPageData {
   now: number;
   pending: db.ProspectM1Item[];
   unconfirmed: db.ProspectM1Item[];
+  /** Enrolled threads with no inbound, and the step due now (T19). */
+  followups: db.ProspectFollowupItem[];
   drafts: db.ProspectQueueItem[];
   manual: db.ProspectManualItem[];
   /** Unanswered inbounds with no draft yet, past the 20 h warning line. */
@@ -269,6 +316,16 @@ export function prospectsPage(d: ProspectsPageData): Response {
           d.unconfirmed.length === 0
             ? empty("Ningún M1 esperando su eco.")
             : d.unconfirmed.map((item) => unconfirmedCard(item, d.now)).join("")
+        }
+      </section>
+
+      <section id="seguimientos" class="queue">
+        <h2>Seguimientos <span class="small muted">${d.followups.length}</span></h2>
+        ${
+          d.followups.length === 0
+            ? empty("Ningún hilo esperando seguimiento.")
+            : d.followups.map((item, i) => followupCard(item, i)).join("") +
+              (d.followups.some((i) => i.step === "dm") ? COPY_SCRIPT : "")
         }
       </section>
 
@@ -369,6 +426,88 @@ function unconfirmedCard(item: db.ProspectM1Item, now: number): string {
     </form>
   </div>`;
 }
+
+/** The profile a touch happens on — the public page, opened in the app. */
+const profileUrl = (handle: string) => `https://www.instagram.com/${encodeURIComponent(handle)}/`;
+
+/**
+ * The follow-up card (T19). One step per thread: the touch until day 7, then the
+ * single follow-up DM. Neither writes any text to the server: the DM is copied
+ * from the box and pasted into Instagram by hand, which is the whole rule.
+ */
+function followupCard(item: db.ProspectFollowupItem, i: number): string {
+  const { thread, step, days } = item;
+  const header = `<h3>${title(thread.name, thread.handle)}</h3>
+    <p class="small muted" style="margin:.15rem 0 .5rem">@${esc(thread.handle)}${
+      thread.nicho ? ` · ${esc(thread.nicho)}` : ""
+    } · sin respuesta desde hace ${days} d</p>`;
+
+  if (step === "toque") {
+    return `<div class="card">
+    ${header}
+    <p class="small">Comenta una publicación suya o responde a una story. Nada de DM nuevo.</p>
+    <div class="actions">
+      <a href="${esc(profileUrl(thread.handle))}" target="_blank" rel="noopener">
+        <button type="button">Abrir perfil</button>
+      </a>
+    </div>
+    <form method="post" action="/prospects/followups">
+      <input type="hidden" name="lead_id" value="${esc(thread.leadId)}">
+      <input type="hidden" name="action" value="touch">
+      <div class="actions"><button class="primary" type="submit">Hecho</button></div>
+    </form>
+    <p class="small muted">El toque no es un DM: comenta o responde a una story desde tu
+      cuenta. «Hecho» solo apunta que lo has hecho; no envía nada.</p>
+  </div>`;
+  }
+
+  return `<div class="card">
+    ${header}
+    <p class="small">DM de seguimiento: un único mensaje corto, escrito y enviado a mano desde
+      el móvil. No repite el M1.</p>
+    <label for="followup-text-${i}">Mensaje <span class="muted">— solo para copiarlo</span></label>
+    <textarea id="followup-text-${i}" rows="4"></textarea>
+    <div class="actions">
+      <button type="button" data-copy="followup-text-${i}">Copiar</button>
+      <a href="${esc(chatUrl(thread.handle))}" target="_blank" rel="noopener">
+        <button type="button">Abrir chat</button>
+      </a>
+    </div>
+    <form method="post" action="/prospects/followups">
+      <input type="hidden" name="lead_id" value="${esc(thread.leadId)}">
+      <input type="hidden" name="action" value="followup">
+      <div class="actions"><button class="primary" type="submit">Enviado</button></div>
+    </form>
+    <p class="small muted">«Copiar» no guarda ni envía el texto: el mensaje sale de tu móvil.
+      «Enviado» apunta el seguimiento para que no se pida dos veces.</p>
+  </div>`;
+}
+
+/**
+ * Wires every "Copiar" of the follow-up queue to its own box, once per page.
+ *
+ * The box is read at click time and nothing is registered: a follow-up DM is
+ * already on a thread the echo enrolled, so there is no hash to store and no
+ * echo to wait for.
+ */
+const COPY_SCRIPT = `<script>
+    (function () {
+      var buttons = document.querySelectorAll("[data-copy]");
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].addEventListener("click", function () {
+          var box = document.getElementById(this.getAttribute("data-copy"));
+          if (!box) return;
+          box.focus();
+          box.select();
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(box.value).catch(function () {});
+          } else {
+            try { document.execCommand("copy"); } catch (e) {}
+          }
+        });
+      }
+    })();
+  </script>`;
 
 function draftCard(item: db.ProspectQueueItem, now: number, i: number): string {
   const { thread, draft, inbound } = item;

@@ -188,6 +188,13 @@ function presentThread(t: db.ProspectThreadDetail) {
     version: t.version,
     last_inbound_at: t.lastInboundAt,
     last_outbound_at: t.lastOutboundAt,
+    // The follow-up anchors (T19): when the M1 echo enrolled the thread, and the
+    // two manual steps it has marked since. `close_reason` is how the CLI tells
+    // a thread the Worker closed from one a person did.
+    enrolled_at: t.enrolledAt,
+    touch_done_at: t.touchDoneAt,
+    followup_sent_at: t.followupSentAt,
+    close_reason: t.closeReason,
     profile_summary: storedProfileSummary(t.profileSummary),
     profile_read_at: t.profileReadAt,
     created_at: t.createdAt,

@@ -24,7 +24,11 @@ import {
 } from "./instagram";
 import { dataDeletionPage, privacyPage } from "./pages";
 import { handleProspectsPage } from "./prospects-page";
-import { extractProspectEvents, handleProspectEvents } from "./prospects";
+import {
+  closeUnansweredProspects,
+  extractProspectEvents,
+  handleProspectEvents,
+} from "./prospects";
 
 export interface Env {
   DB: D1Database;
@@ -324,9 +328,15 @@ export default {
    * Token refresh and missed-webhook reconciliation — see src/cron.ts. Awaited
    * rather than handed to waitUntil, so a throw shows up against the scheduled
    * event in `wrangler tail` instead of as a stray log line.
+   *
+   * The follow-up close (T19) rides the same triggers: a thread whose M1 echo is
+   * fourteen days old and still has no inbound closes itself here. It is one
+   * conditional UPDATE, so it costs nothing on the daily token run and writes
+   * nothing at all once the row is closed.
    */
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     await scheduled(controller, env);
+    await closeUnansweredProspects(env);
   },
 };
 

@@ -490,11 +490,13 @@ export async function enrollProspectThread(
       .prepare(
         `UPDATE prospect_threads
          SET igsid = ?, state = 'enrolled', version = version + 1,
-             last_outbound_at = ?, updated_at = ?
+             last_outbound_at = ?, enrolled_at = ?, updated_at = ?
          WHERE lead_id = ? AND ig_user_id = ? AND state = 'm1_pendiente'
            AND igsid IS NULL AND version = ?`,
       )
-      .bind(t.igsid, t.sentAt, now, t.leadId, t.igUserId, t.expectedVersion),
+      // `enrolled_at` is the echo's own timestamp, which is when the operator
+      // sent the M1 — the moment the follow-up days count from (T19).
+      .bind(t.igsid, t.sentAt, t.sentAt, now, t.leadId, t.igUserId, t.expectedVersion),
     db
       .prepare(
         `INSERT OR IGNORE INTO prospect_messages
@@ -643,6 +645,15 @@ export interface ProspectThreadDetail {
   version: number;
   lastInboundAt: number | null;
   lastOutboundAt: number | null;
+  /** The M1 echo's timestamp — when the thread enrolled, and what the
+   *  follow-up days count from. Null until that echo arrives. */
+  enrolledAt: number | null;
+  /** "Hecho" on the follow-up queue's touch step (T19). */
+  touchDoneAt: number | null;
+  /** "Enviado" on the follow-up queue's DM step (T19). */
+  followupSentAt: number | null;
+  /** `no_reply` when the scheduled job closed it; null for every other close. */
+  closeReason: string | null;
   /** JSON text of the profile read (T14). Never an id Meta gave us (L12). */
   profileSummary: string | null;
   /** When that profile was read; the gate's `profile_read` evidence. */
@@ -664,6 +675,10 @@ interface ProspectThreadDetailRow {
   version: number;
   last_inbound_at: number | null;
   last_outbound_at: number | null;
+  enrolled_at: number | null;
+  touch_done_at: number | null;
+  followup_sent_at: number | null;
+  close_reason: string | null;
   profile_summary: string | null;
   profile_read_at: number | null;
   created_at: number;
@@ -671,8 +686,9 @@ interface ProspectThreadDetailRow {
 }
 
 const PROSPECT_THREAD_COLUMNS = `lead_id, ig_user_id, igsid, handle, name, nicho, state, m1_sha,
-         m1_registered_at, version, last_inbound_at, last_outbound_at, profile_summary,
-         profile_read_at, created_at, updated_at`;
+         m1_registered_at, version, last_inbound_at, last_outbound_at, enrolled_at,
+         touch_done_at, followup_sent_at, close_reason, profile_summary, profile_read_at,
+         created_at, updated_at`;
 
 const toProspectThreadDetail = (r: ProspectThreadDetailRow): ProspectThreadDetail => ({
   leadId: r.lead_id,
@@ -687,6 +703,10 @@ const toProspectThreadDetail = (r: ProspectThreadDetailRow): ProspectThreadDetai
   version: r.version,
   lastInboundAt: r.last_inbound_at,
   lastOutboundAt: r.last_outbound_at,
+  enrolledAt: r.enrolled_at,
+  touchDoneAt: r.touch_done_at,
+  followupSentAt: r.followup_sent_at,
+  closeReason: r.close_reason,
   profileSummary: r.profile_summary,
   profileReadAt: r.profile_read_at,
   createdAt: r.created_at,
@@ -1527,6 +1547,7 @@ export async function prospectWork(
     .prepare(
       `SELECT t.lead_id, t.ig_user_id, t.igsid, t.handle, t.name, t.nicho, t.state, t.m1_sha,
               t.m1_registered_at, t.version, t.last_inbound_at, t.last_outbound_at,
+              t.enrolled_at, t.touch_done_at, t.followup_sent_at, t.close_reason,
               t.profile_summary, t.profile_read_at, t.created_at, t.updated_at,
               m.mid AS inbound_mid, m.text AS inbound_text, m.sent_at AS inbound_sent_at,
               m.origin AS inbound_origin, m.drafted_at AS inbound_drafted_at,
@@ -1574,6 +1595,156 @@ export async function prospectWork(
   }
 
   return items;
+}
+
+/* ------------------------------------------------- prospect follow-ups (T19) */
+
+const DAY_MS = 86_400_000;
+
+/** From this long after the M1 echo, the no-DM touch is the step due. */
+export const FOLLOWUP_TOUCH_AFTER_MS = 3 * DAY_MS;
+
+/** From here the single hand-sent follow-up DM replaces it. */
+export const FOLLOWUP_DM_AFTER_MS = 7 * DAY_MS;
+
+/** A thread still without an inbound by here is closed with `no_reply`. */
+export const FOLLOWUP_CLOSE_AFTER_MS = 14 * DAY_MS;
+
+export type ProspectFollowupStep = "toque" | "dm";
+
+export interface ProspectFollowupItem {
+  thread: ProspectThreadDetail;
+  /** Which of the two manual steps is due right now. */
+  step: ProspectFollowupStep;
+  /** Whole days since the M1 echo — what the card shows. */
+  days: number;
+}
+
+/**
+ * The "Seguimientos" queue: enrolled threads the lead never answered, with the
+ * step that is due now.
+ *
+ * "Never answered" is the absence of any inbound message, not a null column: a
+ * thread the lead wrote back to leaves the queue the moment that message lands,
+ * and the steps themselves are never shown again. Only one step is due at a
+ * time — at day 7 the DM replaces the touch rather than sitting next to it —
+ * and a step already marked stops being due. A thread past the closing line is
+ * left out until the scheduled job closes it, so nothing invites a follow-up to
+ * a thread that is about to be retired.
+ */
+export async function prospectFollowupQueue(
+  db: D1Database,
+  now = Date.now(),
+): Promise<ProspectFollowupItem[]> {
+  const touchCutoff = now - FOLLOWUP_TOUCH_AFTER_MS;
+  const dmCutoff = now - FOLLOWUP_DM_AFTER_MS;
+  const closeCutoff = now - FOLLOWUP_CLOSE_AFTER_MS;
+
+  const { results } = await db
+    .prepare(
+      `SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads
+       WHERE state = 'enrolled' AND igsid IS NOT NULL
+         AND enrolled_at IS NOT NULL AND enrolled_at > ?
+         AND NOT EXISTS (
+           SELECT 1 FROM prospect_messages m
+           WHERE m.lead_id = prospect_threads.lead_id AND m.direction = 'in')
+         AND (
+           (enrolled_at <= ? AND followup_sent_at IS NULL)
+           OR (enrolled_at <= ? AND enrolled_at > ? AND touch_done_at IS NULL)
+         )
+       ORDER BY enrolled_at ASC, lead_id ASC`,
+    )
+    .bind(closeCutoff, dmCutoff, touchCutoff, dmCutoff)
+    .all<ProspectThreadDetailRow>();
+
+  return results.map((row) => {
+    const thread = toProspectThreadDetail(row);
+    return {
+      thread,
+      step: thread.enrolledAt !== null && thread.enrolledAt <= dmCutoff ? "dm" : "toque",
+      days: Math.floor(Math.max(0, now - (thread.enrolledAt ?? now)) / DAY_MS),
+    };
+  });
+}
+
+/**
+ * "Hecho" on the touch step: a comment on a post or a reply to a story, never a
+ * new DM. Marks the step once, for a thread that is still in the queue — one
+ * the lead has answered, one that already has the mark, and one whose DM step
+ * has already been sent are all refused rather than overwritten.
+ */
+export async function markProspectTouchDone(
+  db: D1Database,
+  leadId: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE prospect_threads SET touch_done_at = ?, updated_at = ?
+       WHERE lead_id = ? AND state = 'enrolled' AND igsid IS NOT NULL
+         AND enrolled_at IS NOT NULL AND touch_done_at IS NULL AND followup_sent_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM prospect_messages m
+           WHERE m.lead_id = prospect_threads.lead_id AND m.direction = 'in')`,
+    )
+    .bind(now, now, leadId)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+/**
+ * "Enviado" on the DM step: the operator sent the follow-up from his phone.
+ *
+ * Nothing is stored from what he wrote — the page copies it and he pastes it —
+ * and nothing is sent: this records that the one manual DM happened, which is
+ * what keeps the queue from asking for it twice.
+ */
+export async function markProspectFollowupSent(
+  db: D1Database,
+  leadId: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `UPDATE prospect_threads SET followup_sent_at = ?, updated_at = ?
+       WHERE lead_id = ? AND state = 'enrolled' AND igsid IS NOT NULL
+         AND enrolled_at IS NOT NULL AND followup_sent_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM prospect_messages m
+           WHERE m.lead_id = prospect_threads.lead_id AND m.direction = 'in')`,
+    )
+    .bind(now, now, leadId)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+/**
+ * Closes every enrolled thread the lead never answered by the closing line.
+ *
+ * The `state = 'enrolled'` condition is what makes it idempotent: a closed row
+ * no longer matches, so a second run in the same hour writes nothing and leaves
+ * `updated_at` alone. The reason is stored rather than derived, because "closed"
+ * alone cannot tell a thread the Worker retired from one a person did.
+ */
+export async function closeUnansweredProspectThreads(
+  db: D1Database,
+  now = Date.now(),
+): Promise<number> {
+  const result = await db
+    .prepare(
+      `UPDATE prospect_threads
+       SET state = 'closed', close_reason = 'no_reply', updated_at = ?
+       WHERE state = 'enrolled' AND enrolled_at IS NOT NULL AND enrolled_at <= ?
+         AND NOT EXISTS (
+           SELECT 1 FROM prospect_messages m
+           WHERE m.lead_id = prospect_threads.lead_id AND m.direction = 'in')`,
+    )
+    .bind(now, now - FOLLOWUP_CLOSE_AFTER_MS)
+    .run();
+
+  return result.meta.changes ?? 0;
 }
 
 /**

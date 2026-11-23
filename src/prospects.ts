@@ -203,6 +203,21 @@ async function handleEcho(event: ProspectEvent, env: Env): Promise<void> {
 }
 
 /**
+ * Closes the threads the lead never answered, fourteen days after the M1 echo
+ * (T19). Runs on the scheduled trigger and is idempotent by state, so a second
+ * run in the same hour writes nothing. The log is a count: a closed thread's
+ * handle is not something the Worker's logs carry.
+ */
+export async function closeUnansweredProspects(
+  env: Env,
+  now = Date.now(),
+): Promise<number> {
+  const closed = await db.closeUnansweredProspectThreads(env.DB, now);
+  if (closed > 0) console.log(`prospect followup: closed=${closed}`);
+  return closed;
+}
+
+/**
  * Whether this echo is the copy of a send we already made, whose `mid` has not
  * reached D1 yet.
  *

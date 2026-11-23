@@ -383,7 +383,7 @@ is the only enrollment; nothing is matched by handle, prefix or timing.
 | `POST /api/prospects/drafts` | Leave a draft for the mobile page (`draft_id`, `lead_id`, `kind` = `m1`/`reply`, `text`, `base_version`; optional `stage`, `variant_id`). Idempotent by `draft_id`: the same payload answers 200 `created: false`, a changed one is 409 `draft_conflict` |
 | `GET /api/prospects/work?limit=` | Enrolled threads whose latest message is the lead's, oldest wait first (limit 1–100, default 50), each with `expiring` from 20 h and `expired` past 24 h |
 | `POST /api/prospects/authorizations` | Record the autopilot gate result for one draft (`draft_id`, `category`, `expires_at`, optional `gate_reason`). An **upsert on `(draft_id, category)`**: a repeated pass rewrites the row instead of adding one, answers 200 `created: false`, and keeps the original `created_at` so the send delay does not restart |
-| `GET /api/prospects/export?since=` | Threads, message metadata, drafts and the authorizations that still stand (`since` is epoch ms; 0 means all) |
+| `GET /api/prospects/export?since=` | Threads (including `enrolled_at`, `touch_done_at`, `followup_sent_at` and `close_reason`), message metadata, drafts and the authorizations that still stand (`since` is epoch ms; 0 means all) |
 
 **Message text is not in the export.** The board and the session summary need activity,
 not what anyone said, so messages carry `mid`, direction, origin and timestamps only.
@@ -411,13 +411,26 @@ without one — the kill switch, the approved status, the conversation version a
 here can never make a send that those checks refuse. An expired authorization is not in
 the export; a refused one is, with its reason, so the CLI can see its own last answer.
 
-`/prospects` is the companion page: four queues over the same threads, behind the
+**The follow-up of an M1 nobody answered is two manual steps and a close.** An enrolled
+thread with no inbound message is in the page's `Seguimientos` queue, and the days are
+counted from `enrolled_at` — the M1 echo's own timestamp, written when the echo enrolls
+the thread (the migration backfills it for the threads that enrolled earlier). From day 3
+the queue offers a touch without a DM (comment on a post or reply to a story); from day 7
+the touch is replaced by one short follow-up DM, written and sent by hand from the phone
+and only copied by the page; at day 14 with still no inbound the scheduled job closes the
+thread (`state: closed`, `close_reason: no_reply`). `touch_done_at` (button `Hecho`) and
+`followup_sent_at` (button `Enviado`) are the marks, one per step, and both are in the
+export. Nothing on this path sends by API or autopilot: a second unprompted DM is what
+gets an account restricted. An inbound from the lead at any moment takes the thread out
+of the queue, and a mark that arrives after that is refused rather than overwriting it.
+
+`/prospects` is the companion page: five queues over the same threads, behind the
 dashboard session, for the sessions on a phone.
 
 **How proven it is.** The echo enrollment was observed against live Meta (a DM sent from
 the phone came back with the recipient's IGSID). The rest of this flow — the API, the page,
-the send path and the autopilot cron — is implemented and covered by the test suite but
-has not yet carried a real conversation end to end.
+the follow-up queue, the send path and the autopilot cron — is implemented and covered by
+the test suite but has not yet carried a real conversation end to end.
 
 ## Things Meta doesn't tell you
 
