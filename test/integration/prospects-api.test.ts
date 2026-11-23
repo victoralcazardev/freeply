@@ -186,6 +186,7 @@ afterEach(() => vi.restoreAllMocks());
 
 const ROUTES: Array<[string, string, unknown]> = [
   ["POST", "/api/prospects/threads", { lead_id: "l", handle: "a" }],
+  ["POST", "/api/prospects/threads/close", { lead_id: "l", reason: "otro" }],
   ["POST", "/api/prospects/expected-m1", { lead_id: "l", text: "Hola" }],
   ["POST", "/api/prospects/drafts", { draft_id: "d", lead_id: "l" }],
   ["GET", "/api/prospects/work", undefined],
@@ -424,6 +425,167 @@ describe("POST /api/prospects/threads", () => {
     // None of them wrote anything: the payload is validated before the thread is
     // touched, so a refusal cannot leave half a row behind.
     expect((await call("GET", "/api/prospects/export")).json.threads).toEqual([]);
+  });
+});
+
+describe("POST /api/prospects/threads/close", () => {
+  it("closes a pending, an unconfirmed and an enrolled thread", async () => {
+    const at = Date.now() - HOUR;
+    await call("POST", "/api/prospects/threads", { lead_id: "lead-pending", handle: "lead.pending" });
+    await call("POST", "/api/prospects/threads", {
+      lead_id: "lead-unconfirmed",
+      handle: "lead.unconfirmed",
+    });
+    await env.DB.prepare(
+      `UPDATE prospect_threads SET state = 'm1_sin_confirmar' WHERE lead_id = ?`,
+    )
+      .bind("lead-unconfirmed")
+      .run();
+    await enroll({ leadId: "lead-enrolled", peerId: "peer-enrolled", m1: "Hola, soy Víctor.", at });
+
+    for (const [leadId, reason] of [
+      ["lead-pending", "no_interesa"],
+      ["lead-unconfirmed", "fuera_de_nicho"],
+      ["lead-enrolled", "no_interesa"],
+    ] as const) {
+      const r = await call("POST", "/api/prospects/threads/close", {
+        lead_id: leadId,
+        reason,
+      });
+      expect(r.status).toBe(200);
+      expect(r.json.closed).toBe(true);
+      expect(r.json.thread).toMatchObject({ lead_id: leadId, state: "closed", close_reason: reason });
+    }
+
+    const exported = await call("GET", "/api/prospects/export");
+    const byLead = Object.fromEntries(
+      exported.json.threads.map((t: any) => [t.lead_id, [t.state, t.close_reason]]),
+    );
+    expect(byLead).toEqual({
+      "lead-pending": ["closed", "no_interesa"],
+      "lead-unconfirmed": ["closed", "fuera_de_nicho"],
+      "lead-enrolled": ["closed", "no_interesa"],
+    });
+  });
+
+  it("rejects an unknown reason and an unknown lead", async () => {
+    await call("POST", "/api/prospects/threads", { lead_id: "lead-1", handle: "ana.leads" });
+
+    expect(
+      await call("POST", "/api/prospects/threads/close", {
+        lead_id: "lead-1",
+        reason: "spam",
+      }),
+    ).toEqual({
+      status: 400,
+      json: {
+        error: "invalid_field",
+        detail: "reason: must be one of no_interesa, fuera_de_nicho, no_reply, otro",
+      },
+    });
+    expect(
+      await call("POST", "/api/prospects/threads/close", { lead_id: "lead-1" }),
+    ).toEqual({ status: 400, json: { error: "invalid_field", detail: "reason: must be a string" } });
+    expect(
+      await call("POST", "/api/prospects/threads/close", {
+        lead_id: "nope",
+        reason: "otro",
+      }),
+    ).toEqual({ status: 404, json: { error: "not_found" } });
+
+    expect((await call("GET", "/api/prospects/export")).json.threads[0].state).toBe(
+      "m1_pendiente",
+    );
+  });
+
+  it("is idempotent with the same reason and refuses a different one", async () => {
+    const at = Date.now() - HOUR;
+    await enroll({ leadId: "lead-1", peerId: "peer-1", m1: "Hola, soy Víctor.", at });
+
+    const first = await call("POST", "/api/prospects/threads/close", {
+      lead_id: "lead-1",
+      reason: "no_interesa",
+    });
+    expect(first.status).toBe(200);
+    expect(first.json.closed).toBe(true);
+
+    const again = await call("POST", "/api/prospects/threads/close", {
+      lead_id: "lead-1",
+      reason: "no_interesa",
+    });
+    expect(again).toEqual({ status: 200, json: { closed: false } });
+
+    const conflict = await call("POST", "/api/prospects/threads/close", {
+      lead_id: "lead-1",
+      reason: "otro",
+    });
+    expect(conflict).toEqual({ status: 409, json: { error: "thread_closed" } });
+
+    // The first reason stands; a later request never rewrites why.
+    expect((await call("GET", "/api/prospects/export")).json.threads[0].close_reason).toBe(
+      "no_interesa",
+    );
+  });
+
+  it("invalidates pending drafts and refuses to re-arm the thread", async () => {
+    const at = Date.now() - HOUR;
+    await enroll({ leadId: "lead-1", peerId: "peer-1", m1: "Hola, soy Víctor.", at });
+    await deliver(
+      inbound({ peerId: "peer-1", text: "Cuéntame más", mid: "mid_in_1", at: at + 1000 }),
+    );
+    const version = await threadVersion("lead-1");
+
+    for (const [draftId, status] of [
+      ["draft-waiting", "waiting"],
+      ["draft-approved", "approved"],
+    ] as const) {
+      await call("POST", "/api/prospects/drafts", {
+        draft_id: draftId,
+        lead_id: "lead-1",
+        kind: "reply",
+        stage: "Filtro",
+        text: "Te cuento.",
+        base_version: version,
+      });
+      if (status === "approved") {
+        await env.DB.prepare(
+          `UPDATE prospect_drafts SET status = 'approved', decided_text = ?, decided_at = ?
+           WHERE draft_id = ?`,
+        )
+          .bind("Te cuento.", at, draftId)
+          .run();
+      }
+    }
+
+    const closed = await call("POST", "/api/prospects/threads/close", {
+      lead_id: "lead-1",
+      reason: "no_interesa",
+    });
+    expect(closed.status).toBe(200);
+
+    const drafts = await call("GET", "/api/prospects/export");
+    const statuses = Object.fromEntries(
+      drafts.json.drafts.map((d: any) => [d.draft_id, d.status]),
+    );
+    expect(statuses).toEqual({
+      "draft-waiting": "invalidated",
+      "draft-approved": "invalidated",
+    });
+
+    // A closed thread can never be armed again, through either route.
+    expect(
+      await call("POST", "/api/prospects/expected-m1", {
+        lead_id: "lead-1",
+        text: "Hola, soy Víctor.",
+      }),
+    ).toEqual({ status: 409, json: { error: "thread_closed" } });
+    expect(
+      await call("POST", "/api/prospects/threads", {
+        lead_id: "lead-1",
+        handle: handleFor("lead-1"),
+        m1_text: "Hola, soy Víctor.",
+      }),
+    ).toEqual({ status: 409, json: { error: "thread_closed" } });
   });
 });
 

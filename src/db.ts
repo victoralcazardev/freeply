@@ -1214,24 +1214,62 @@ export interface ProspectM1Item {
 }
 
 /**
- * The two M1 queues: what to send now, and what was copied with no echo back.
+ * The latest M1 draft of a thread: the one its editable box shows and the one
+ * whose push order decides where the thread sits in the send queue.
  *
- * A thread whose text was copied less than `M1_UNCONFIRMED_AFTER_MS` ago stays in
- * the first queue — the echo may still be in flight — and moves to the second
- * after that, where the only way forward is copying it again.
+ * Oldest batch first. A thread the CLI drafted twice belongs to the later push,
+ * because that is the text a person would copy now.
+ */
+const M1_DRAFT_ORDER = `(
+  SELECT d.created_at FROM prospect_drafts d
+   WHERE d.lead_id = prospect_threads.lead_id AND d.kind = 'm1'
+   ORDER BY d.created_at DESC, d.draft_id DESC LIMIT 1)`;
+
+const M1_DRAFT_ID = `(
+  SELECT d.draft_id FROM prospect_drafts d
+   WHERE d.lead_id = prospect_threads.lead_id AND d.kind = 'm1'
+   ORDER BY d.created_at DESC, d.draft_id DESC LIMIT 1)`;
+
+/**
+ * The M1 queues: what is still uncopied, what was copied and is waiting for its
+ * echo, and what was copied so long ago that the echo is not coming.
+ *
+ * "M1 por enviar" only holds threads never copied (`m1_registered_at IS NULL`),
+ * in the order their latest M1 draft was pushed. A copied thread used to stay on
+ * top for thirty minutes, which put the same person in front of the operator
+ * again and again; it now moves out of the queue immediately and into the
+ * collapsed "Copiados, esperando confirmación" section. After
+ * `M1_UNCONFIRMED_AFTER_MS` it joins "M1 sin confirmar", where the only way
+ * forward is copying it again.
  */
 export async function prospectM1Queue(
   db: D1Database,
   now = Date.now(),
-): Promise<{ pending: ProspectM1Item[]; unconfirmed: ProspectM1Item[] }> {
+): Promise<{
+  pending: ProspectM1Item[];
+  copied: ProspectM1Item[];
+  unconfirmed: ProspectM1Item[];
+}> {
   const cutoff = now - M1_UNCONFIRMED_AFTER_MS;
-  const [pendingRows, unconfirmedRows] = await Promise.all([
+  const [pendingRows, copiedRows, unconfirmedRows] = await Promise.all([
     db
       .prepare(
         `SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads
-         WHERE state = 'm1_pendiente'
-           AND (m1_registered_at IS NULL OR m1_registered_at > ?)
-         ORDER BY created_at ASC, lead_id ASC`,
+         WHERE state = 'm1_pendiente' AND m1_registered_at IS NULL
+         ORDER BY ${M1_DRAFT_ORDER} IS NULL ASC,
+                  ${M1_DRAFT_ORDER} ASC,
+                  ${M1_DRAFT_ID} ASC,
+                  created_at ASC, lead_id ASC`,
+      )
+      .all<ProspectThreadDetailRow>(),
+    // Copied, but the echo is still allowed to be in flight. This is the section
+    // that used to be the top of the send queue.
+    db
+      .prepare(
+        `SELECT ${PROSPECT_THREAD_COLUMNS} FROM prospect_threads
+         WHERE state = 'm1_pendiente' AND m1_registered_at IS NOT NULL
+           AND m1_registered_at > ?
+         ORDER BY m1_registered_at ASC, lead_id ASC`,
       )
       .bind(cutoff)
       .all<ProspectThreadDetailRow>(),
@@ -1250,14 +1288,22 @@ export async function prospectM1Queue(
   ]);
 
   const pending = pendingRows.results.map(toProspectThreadDetail);
+  const copied = copiedRows.results.map(toProspectThreadDetail);
   const unconfirmed = unconfirmedRows.results.map(toProspectThreadDetail);
-  const texts = await latestM1Texts(db, [...pending, ...unconfirmed].map((t) => t.leadId));
+  const texts = await latestM1Texts(
+    db,
+    [...pending, ...copied, ...unconfirmed].map((t) => t.leadId),
+  );
   const withText = (t: ProspectThreadDetail): ProspectM1Item => ({
     thread: t,
     text: texts.get(t.leadId) ?? null,
   });
 
-  return { pending: pending.map(withText), unconfirmed: unconfirmed.map(withText) };
+  return {
+    pending: pending.map(withText),
+    copied: copied.map(withText),
+    unconfirmed: unconfirmed.map(withText),
+  };
 }
 
 /** The CLI's latest M1 draft per lead — the starting point of the editable box. */
@@ -1332,6 +1378,8 @@ export async function prospectManualQueue(
   const manual: ProspectManualItem[] = [];
 
   for (const item of items) {
+    // A closed thread is never sent to again, so it has no manual work either.
+    if (item.thread.state === "closed") continue;
     if (item.draft.status === "send_state_unknown") {
       manual.push({ ...item, reason: "send_state_unknown" });
       continue;
@@ -1463,6 +1511,90 @@ export async function retryProspectM1(
     .run();
 
   return (result.meta.changes ?? 0) > 0;
+}
+
+/** Why a person closed a thread. `no_reply` is the one the cron also writes. */
+export const PROSPECT_CLOSE_REASONS = [
+  "no_interesa",
+  "fuera_de_nicho",
+  "no_reply",
+  "otro",
+] as const;
+
+export type ProspectCloseReason = (typeof PROSPECT_CLOSE_REASONS)[number];
+
+export function isProspectCloseReason(value: string): value is ProspectCloseReason {
+  return (PROSPECT_CLOSE_REASONS as readonly string[]).includes(value);
+}
+
+export type ProspectCloseOutcome =
+  | { ok: true; closed: boolean; thread: ProspectThreadDetail }
+  | { ok: false; error: "not_found" | "thread_closed" };
+
+/**
+ * Closes a thread by hand and retires every draft that was still sendable.
+ *
+ * Valid for any open state: `m1_pendiente` (copied or not), `m1_sin_confirmar`
+ * and `enrolled`. The close is permanent — the thread can never be re-armed — so
+ * a repeated request with the same reason answers `closed: false` and writes
+ * nothing, while a different reason is a conflict rather than a silent rewrite
+ * of why somebody is not to be contacted. Pending drafts are invalidated in the
+ * same batch: a message written before the close must not be sendable after it.
+ */
+export async function closeProspectThread(
+  db: D1Database,
+  c: { leadId: string; reason: ProspectCloseReason; now?: number },
+): Promise<ProspectCloseOutcome> {
+  const existing = await getProspectThread(db, c.leadId);
+  if (!existing) return { ok: false, error: "not_found" };
+
+  if (existing.state === "closed") {
+    if (existing.closeReason !== c.reason) return { ok: false, error: "thread_closed" };
+    // A close that raced an earlier one may have left a draft behind; the
+    // invariant "a closed thread has nothing sendable" is restored here.
+    await invalidateProspectDrafts(db, c.leadId);
+    return { ok: true, closed: false, thread: existing };
+  }
+
+  const now = c.now ?? Date.now();
+  const results = await db.batch([
+    db
+      .prepare(
+        `UPDATE prospect_threads SET state = 'closed', close_reason = ?, updated_at = ?
+         WHERE lead_id = ? AND state != 'closed'`,
+      )
+      .bind(c.reason, now, c.leadId),
+    db
+      .prepare(
+        `UPDATE prospect_drafts SET status = 'invalidated'
+         WHERE lead_id = ? AND status IN ('waiting', 'approved')`,
+      )
+      .bind(c.leadId),
+  ]);
+
+  if ((results[0]?.meta.changes ?? 0) === 0) {
+    const raced = await getProspectThread(db, c.leadId);
+    if (!raced) return { ok: false, error: "not_found" };
+    if (raced.state === "closed" && raced.closeReason === c.reason) {
+      return { ok: true, closed: false, thread: raced };
+    }
+    return { ok: false, error: "thread_closed" };
+  }
+
+  const thread = await getProspectThread(db, c.leadId);
+  if (!thread) return { ok: false, error: "not_found" };
+  return { ok: true, closed: true, thread };
+}
+
+/** The drafts of a thread that could still have been sent before it closed. */
+async function invalidateProspectDrafts(db: D1Database, leadId: string): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE prospect_drafts SET status = 'invalidated'
+       WHERE lead_id = ? AND status IN ('waiting', 'approved')`,
+    )
+    .bind(leadId)
+    .run();
 }
 
 /**

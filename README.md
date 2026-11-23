@@ -380,6 +380,7 @@ is the only enrollment; nothing is matched by handle, prefix or timing.
 |---|---|
 | `POST /api/prospects/threads` | Create or refresh a thread from the Sheet row (`lead_id`, `handle` required; optional `name`, `nicho`, `ig_user_id`, `m1_text`, `profile_summary`, `profile_read_at`). Answers `{thread, created}` — 201 and `created: true` for a new row, 200 and `false` for a refresh |
 | `POST /api/prospects/expected-m1` | Register the final text of the M1 (`lead_id`, `text`): stores its normalized sha256 and makes the thread wait for that exact echo. 409 `already_enrolled` once the echo arrived |
+| `POST /api/prospects/threads/close` | Close any open thread by hand (`lead_id`, `reason` = `no_interesa`/`fuera_de_nicho`/`no_reply`/`otro`). Sets `state: closed` and `close_reason` and invalidates its `waiting`/`approved` drafts. Answers 200 `{closed: true, thread}`; the same reason again is 200 `{closed: false}`, a different one is 409 `thread_closed`, and an unknown lead is 404 |
 | `POST /api/prospects/drafts` | Leave a draft for the mobile page (`draft_id`, `lead_id`, `kind` = `m1`/`reply`, `text`, `base_version`; optional `stage`, `variant_id`). Idempotent by `draft_id`: the same payload answers 200 `created: false`, a changed one is 409 `draft_conflict` |
 | `GET /api/prospects/work?limit=` | Enrolled threads whose latest message is the lead's, oldest wait first (limit 1–100, default 50), each with `expiring` from 20 h and `expired` past 24 h |
 | `POST /api/prospects/authorizations` | Record the autopilot gate result for one draft (`draft_id`, `category`, `expires_at`, optional `gate_reason`). An **upsert on `(draft_id, category)`**: a repeated pass rewrites the row instead of adding one, answers 200 `created: false`, and keeps the original `created_at` so the send delay does not restart |
@@ -424,8 +425,26 @@ export. Nothing on this path sends by API or autopilot: a second unprompted DM i
 gets an account restricted. An inbound from the lead at any moment takes the thread out
 of the queue, and a mark that arrives after that is refused rather than overwriting it.
 
-`/prospects` is the companion page: five queues over the same threads, behind the
+`/prospects` is the companion page: the five queues over the same threads, behind the
 dashboard session, for the sessions on a phone.
+
+**The M1 send queue only holds threads that were never copied.** It is ordered by when
+each thread's latest M1 draft was pushed (oldest batch first), not by the lead id or the
+thread's creation time. Copying a text registers it and takes the thread out of the queue
+immediately: it waits in the collapsed `Copiados, esperando confirmación` section until
+the echo arrives, and after 30 minutes without an echo it moves to `M1 sin confirmar`.
+Coming back from Instagram (or reloading) shows the next uncopied lead at the top; the
+page reloads on `visibilitychange`/`focus` unless a box is being edited, and on a
+back-forward-cache restore. M1 text keeps its line breaks in the editable box, in the
+clipboard and in any preview (`white-space: pre-wrap`); registration still compares the
+normalized text, so an echo with the same line breaks or with them collapsed to spaces
+enrolls the same thread.
+
+**Any thread card can be closed by hand.** `No le interesa` posts `reason: no_interesa`
+behind a browser confirm and the dashboard session, the same route the JSON API exposes;
+it is valid for a thread the webhook never enrolled, which is the case the first real "no
+me interesa" exposed. Closing is permanent: it invalidates the thread's pending drafts,
+drops their queued retries, and refuses to arm the M1 again (`thread_closed`).
 
 **How proven it is.** The echo enrollment was observed against live Meta (a DM sent from
 the phone came back with the recipient's IGSID). The rest of this flow — the API, the page,

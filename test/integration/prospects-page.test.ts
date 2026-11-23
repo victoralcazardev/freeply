@@ -250,6 +250,7 @@ async function threadRow(leadId: string) {
     .bind(leadId)
     .first<{
       state: string;
+      close_reason: string | null;
       m1_sha: string | null;
       m1_registered_at: number | null;
       version: number;
@@ -264,6 +265,13 @@ async function draftRow(draftId: string) {
     .first<{ status: string; decided_text: string | null; decided_at: number | null }>();
   if (!row) throw new Error(`draft ${draftId} not found`);
   return row;
+}
+
+/** Place a draft in the batch order the send queue reads, without waiting. */
+async function setDraftPushed(draftId: string, at: number): Promise<void> {
+  await env.DB.prepare(`UPDATE prospect_drafts SET created_at = ? WHERE draft_id = ?`)
+    .bind(at, draftId)
+    .run();
 }
 
 async function pushDraft(o: {
@@ -424,7 +432,7 @@ describe("GET /prospects", () => {
     expect(section(html, "m1-por-enviar")).not.toContain(`@${handleFor("lead-a")}`);
   });
 
-  it("keeps a fresh registered M1 to send and moves an old one to unconfirmed", async () => {
+  it("moves a fresh copy to Copiados and an old one to unconfirmed", async () => {
     for (const leadId of ["lead-now", "lead-old"]) {
       await pendingLead({ leadId, m1Draft: "Hola, soy Víctor." });
       const registered = await call("POST", "/api/prospects/expected-m1", {
@@ -443,10 +451,82 @@ describe("GET /prospects", () => {
       .run();
 
     const { html } = await getPage("/prospects");
-    expect(section(html, "m1-por-enviar")).toContain(`@${handleFor("lead-now")}`);
+    // A copied thread is never in the send queue again, not even while the echo
+    // could still be on its way: it waits in the collapsed section instead.
+    expect(section(html, "m1-por-enviar")).not.toContain(`@${handleFor("lead-now")}`);
     expect(section(html, "m1-por-enviar")).not.toContain(`@${handleFor("lead-old")}`);
+    const copied = section(html, "m1-copiados");
+    expect(copied).toContain(`@${handleFor("lead-now")}`);
+    expect(copied).toContain("Copiado hace");
+    expect(copied).toContain("<details>");
+    expect(copied).not.toContain("<details open");
     expect(section(html, "m1-sin-confirmar")).toContain(`@${handleFor("lead-old")}`);
     expect(section(html, "m1-sin-confirmar")).toContain("hace 2 h");
+  });
+
+  it("lists only uncopied M1s, in the order their drafts were pushed", async () => {
+    // Threads are created c, a, b; drafts are pushed b, c, a. Neither the thread
+    // order nor the lead id may decide the queue.
+    for (const leadId of ["lead-c", "lead-a", "lead-b"]) {
+      await pendingLead({ leadId, m1Draft: `Hola, ${leadId}.` });
+    }
+    const base = Date.now();
+    await setDraftPushed("m1_lead-b", base - 3000);
+    await setDraftPushed("m1_lead-c", base - 2000);
+    await setDraftPushed("m1_lead-a", base - 1000);
+
+    const pending = section((await getPage("/prospects")).html, "m1-por-enviar");
+    const positions = ["lead-b", "lead-c", "lead-a"].map((id) =>
+      pending.indexOf(`@${handleFor(id)}`),
+    );
+    expect(positions).toEqual([...positions].sort((x, y) => x - y));
+    expect(positions.every((position) => position > -1)).toBe(true);
+
+    // Copiying one takes it out of the queue and puts it in the collapsed
+    // section; the next uncopied lead is the first card that remains.
+    const copied = await postPage("/prospects/m1", {
+      lead_id: "lead-c",
+      text: "Hola, lead-c.",
+    });
+    const after = section(copied.html, "m1-por-enviar");
+    expect(after).not.toContain(`@${handleFor("lead-c")}`);
+    expect(after.indexOf(`@${handleFor("lead-b")}`)).toBeLessThan(
+      after.indexOf(`@${handleFor("lead-a")}`),
+    );
+    const waiting = section(copied.html, "m1-copiados");
+    expect(waiting).toContain(`@${handleFor("lead-c")}`);
+    expect(waiting).toContain("Copiado hace");
+
+    // A reload reads the same thing from D1.
+    const later = section((await getPage("/prospects")).html, "m1-copiados");
+    expect(later).toContain(`@${handleFor("lead-c")}`);
+  });
+
+  it("renders and copies the M1 with its line breaks", async () => {
+    const text = "Hola, Ana.\nSoy Víctor.\n¿Te encaja?";
+    await pendingLead({ leadId: "lead-lines", m1Draft: text });
+
+    const page = await getPage("/prospects");
+    expect(section(page.html, "m1-por-enviar")).toContain(`>${text}</textarea>`);
+
+    const copied = await postPage("/prospects/m1", { lead_id: "lead-lines", text });
+    expect(copied.status).toBe(200);
+    // The clipboard box and the preview both keep the newlines; the CSS keeps
+    // the preview's line breaks visible.
+    expect(copied.html).toContain(`id="m1-copy"`);
+    expect(copied.html).toContain(`>${text}</textarea>`);
+    expect(copied.html).toContain(`<pre class="preview">${text}</pre>`);
+    expect(copied.html).toContain("white-space: pre-wrap");
+  });
+
+  it("refreshes on return without losing an edit in progress", async () => {
+    await pendingLead({ leadId: "lead-1", m1Draft: "Hola." });
+    const { html } = await getPage("/prospects");
+    expect(html).toContain('addEventListener("visibilitychange"');
+    expect(html).toContain('addEventListener("focus"');
+    expect(html).toContain("event.persisted");
+    expect(html).toContain("location.reload()");
+    expect(html).toContain("dirty = true");
   });
 
   it("offers the optional warming hint on the send queue and adds no action for it", async () => {
@@ -464,7 +544,10 @@ describe("GET /prospects", () => {
     expect(paragraph).not.toContain("<a ");
     expect(paragraph).not.toContain("<button");
     expect(paragraph).not.toContain("<form");
-    expect(m1.match(/action="\/prospects\//g)).toHaveLength(1);
+    // The card keeps its copy action and gains the close button; the hint adds
+    // neither.
+    expect(m1.match(/action="\/prospects\/m1"/g)).toHaveLength(1);
+    expect(m1.match(/action="\/prospects\/close"/g)).toHaveLength(1);
 
     // Only the queue that sends the M1: warming up is a step before it, not a
     // thing to do once somebody replied.
@@ -567,10 +650,16 @@ describe("POST /prospects/m1", () => {
     expect(response.html).toContain("navigator.clipboard.writeText");
     expect(response.html).toContain(`https://ig.me/m/${handleFor("lead-1")}`);
 
-    // Coming back to the page later it is still waiting for its echo.
+    // The copied card is gone from the top immediately; coming back to the page
+    // later it is still waiting for its echo, in the collapsed section.
+    expect(response.html).toContain("siguiente lead");
+    expect(section(response.html, "m1-por-enviar")).not.toContain(
+      `@${handleFor("lead-1")}`,
+    );
     const later = await getPage("/prospects");
-    expect(section(later.html, "m1-por-enviar")).toContain(`@${handleFor("lead-1")}`);
-    expect(later.html).toContain("Registrado hace");
+    expect(section(later.html, "m1-por-enviar")).not.toContain(`@${handleFor("lead-1")}`);
+    expect(section(later.html, "m1-copiados")).toContain(`@${handleFor("lead-1")}`);
+    expect(section(later.html, "m1-copiados")).toContain("Copiado hace");
   });
 
   it("refuses to re-arm an enrolled thread and to register an empty message", async () => {
@@ -625,6 +714,118 @@ describe("POST /prospects/m1/retry", () => {
     expect(m1).toContain(`@${handleFor("lead-1")}`);
     expect(m1).toContain(">Hola, Ana. Soy Víctor.</textarea>");
     expect(section(html, "m1-sin-confirmar")).not.toContain(`@${handleFor("lead-1")}`);
+  });
+});
+
+describe("POST /prospects/close", () => {
+  it("offers «No le interesa» with a confirm on every thread card", async () => {
+    const now = Date.now();
+    await pendingLead({ leadId: "lead-pending", m1Draft: "Hola." });
+    await pendingLead({ leadId: "lead-copied", m1Draft: "Hola, soy Víctor. Copiado." });
+    await call("POST", "/api/prospects/expected-m1", {
+      lead_id: "lead-copied",
+      text: "Hola, soy Víctor. Copiado.",
+    });
+
+    await pendingLead({ leadId: "lead-old", m1Draft: "Hola, soy Víctor. Antiguo." });
+    await call("POST", "/api/prospects/expected-m1", {
+      lead_id: "lead-old",
+      text: "Hola, soy Víctor. Antiguo.",
+    });
+    await env.DB.prepare(
+      `UPDATE prospect_threads SET m1_registered_at = ? WHERE lead_id = 'lead-old'`,
+    )
+      .bind(now - 2 * HOUR)
+      .run();
+
+    await enrolledLead({
+      leadId: "lead-follow",
+      peerId: "peer-follow",
+      m1: "Hola, soy Víctor. Seguimiento.",
+      at: now - 4 * 24 * HOUR,
+    });
+    const active = await enrolledLead({
+      leadId: "lead-draft",
+      peerId: "peer-draft",
+      m1: "Hola, soy Víctor. Borrador.",
+      at: now - 3 * HOUR,
+    });
+    await leadsReplies({ thread: active, text: "Cuéntame más", at: now - HOUR });
+    await pushDraft({ draftId: "draft-1", leadId: "lead-draft", text: "Te cuento." });
+
+    const { html } = await getPage("/prospects");
+    for (const id of [
+      "m1-por-enviar",
+      "m1-copiados",
+      "m1-sin-confirmar",
+      "seguimientos",
+      "borradores",
+    ]) {
+      const queue = section(html, id);
+      expect(queue, id).toContain('action="/prospects/close"');
+      expect(queue, id).toContain('name="reason" value="no_interesa"');
+      expect(queue, id).toContain("No le interesa");
+      expect(queue, id).toContain("return confirm(");
+    }
+  });
+
+  it("closes a thread, invalidates its drafts and refuses a re-arm or a different reason", async () => {
+    const now = Date.now();
+    await pendingLead({ leadId: "lead-pending", m1Draft: "Hola, soy Víctor." });
+    const active = await enrolledLead({
+      leadId: "lead-draft",
+      peerId: "peer-draft",
+      m1: "Hola, soy Víctor. Borrador.",
+      at: now - 3 * HOUR,
+    });
+    await leadsReplies({ thread: active, text: "Cuéntame más", at: now - HOUR });
+    await pushDraft({ draftId: "draft-1", leadId: "lead-draft", text: "Te cuento." });
+
+    // The button posts exactly these two fields.
+    for (const leadId of ["lead-pending", "lead-draft"]) {
+      const response = await postPage("/prospects/close", {
+        lead_id: leadId,
+        reason: "no_interesa",
+      });
+      expect(response.status).toBe(302);
+      expect(decodeURIComponent(response.location ?? "")).toContain("Hilo cerrado");
+
+      const thread = await threadRow(leadId);
+      expect(thread.state).toBe("closed");
+      expect(thread.close_reason).toBe("no_interesa");
+    }
+    expect((await draftRow("draft-1")).status).toBe("invalidated");
+
+    // A closed thread is gone from every queue, its draft is not pending, and
+    // the M1 box refuses to arm it again.
+    const { html } = await getPage("/prospects");
+    expect(html).not.toContain(`@${handleFor("lead-pending")}`);
+    expect(html).not.toContain(`@${handleFor("lead-draft")}`);
+
+    const approve = await postPage("/prospects/drafts", {
+      draft_id: "draft-1",
+      action: "approve",
+      text: "Te cuento.",
+    });
+    expect(decodeURIComponent(approve.location ?? "")).toContain("ya no está pendiente");
+
+    const rearm = await postPage("/prospects/m1", {
+      lead_id: "lead-pending",
+      text: "Hola otra vez.",
+    });
+    expect(decodeURIComponent(rearm.location ?? "")).toContain("cerrado");
+
+    const again = await postPage("/prospects/close", {
+      lead_id: "lead-pending",
+      reason: "no_interesa",
+    });
+    expect(decodeURIComponent(again.location ?? "")).toContain("ya estaba cerrado");
+
+    const conflict = await postPage("/prospects/close", {
+      lead_id: "lead-pending",
+      reason: "otro",
+    });
+    expect(decodeURIComponent(conflict.location ?? "")).toContain("otro motivo");
   });
 });
 

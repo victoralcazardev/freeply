@@ -272,8 +272,10 @@ export async function registerExpectedM1(
 ): Promise<M1Registration> {
   const thread = await db.getProspectThread(d1, leadId);
   if (!thread) return { ok: false, error: "not_found" };
-  if (thread.igsid !== null) return { ok: false, error: "already_enrolled" };
+  // Closed is the stronger answer: the thread may also have enrolled before a
+  // person closed it, and "thread_closed" is what says it can never be armed.
   if (thread.state === "closed") return { ok: false, error: "thread_closed" };
+  if (thread.igsid !== null) return { ok: false, error: "already_enrolled" };
 
   // The echo is compared in normalized form, so the hash comes from that form.
   if (!(await db.registerProspectM1(d1, { leadId, m1Sha: await prospectTextSha(text) }))) {
@@ -284,6 +286,29 @@ export async function registerExpectedM1(
   const updated = await db.getProspectThread(d1, leadId);
   if (!updated) return { ok: false, error: "not_found" };
   return { ok: true, thread: updated };
+}
+
+/**
+ * Closes a thread by hand (L62), shared by the JSON API and the page's button.
+ *
+ * The database write is one helper so both routes have the same rules about
+ * open states, idempotence and a different reason. The outbox cleanup lives here
+ * because it needs the account's Durable Object: a retry queued before the close
+ * must not keep waking up for a draft that can no longer be sent.
+ */
+export async function closeProspectThread(
+  env: Env,
+  c: { leadId: string; reason: db.ProspectCloseReason; now?: number },
+): Promise<db.ProspectCloseOutcome> {
+  const pending = await db.pendingProspectDraftIds(env.DB, c.leadId);
+  const result = await db.closeProspectThread(env.DB, c);
+  if (!result.ok) return result;
+
+  if (pending.length > 0) {
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(result.thread.igUserId));
+    await account.forgetDrafts(pending);
+  }
+  return result;
 }
 
 /** Why approving a draft failed, as the page reports it. */

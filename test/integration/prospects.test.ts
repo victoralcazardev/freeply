@@ -272,6 +272,37 @@ describe("M1 echo enrollment", () => {
     ]);
   });
 
+  /**
+   * The M1 is copied and sent with line breaks now, and the echo may keep them
+   * or have them collapsed to spaces. Normalization is the same on both sides,
+   * so either form enrolls; nothing about the line breaks changes identity.
+   */
+  it("enrolls when the echo keeps the M1's line breaks, and when it collapses them", async () => {
+    const m1 = "Hola, soy Víctor.\nVi que llevas una agencia.\n¿Te encaja?";
+
+    await seedThread({ leadId: "lead-lines", handle: "lines.handle", m1 });
+    await post(echo({ text: m1, mid: "mid_echo_lines", peerId: "peer-lines" }));
+    expect(await thread("lead-lines")).toMatchObject({
+      igsid: "peer-lines",
+      state: "enrolled",
+      version: 1,
+    });
+
+    await seedThread({ leadId: "lead-spaces", handle: "spaces.handle", m1 });
+    await post(
+      echo({
+        text: m1.replace(/\n/g, " "),
+        mid: "mid_echo_spaces",
+        peerId: "peer-spaces",
+      }),
+    );
+    expect(await thread("lead-spaces")).toMatchObject({
+      igsid: "peer-spaces",
+      state: "enrolled",
+      version: 1,
+    });
+  });
+
   it("writes nothing and logs no content when the echo matches no pending M1", async () => {
     await seedThread({
       leadId: "lead-secret",

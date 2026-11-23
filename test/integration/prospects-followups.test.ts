@@ -353,8 +353,11 @@ describe("the existing queues", () => {
     await enrolledLead({ leadId: "lead-follow", peerId: "peer-z", echoAt: now - 4 * DAY });
 
     const { html } = await getPage();
-    expect(section(html, "m1-por-enviar")).toContain(`@${handleFor("lead-old")}`);
-    expect(section(html, "m1-por-enviar")).toContain(`>${m1}</textarea>`);
+    // A registered M1 is no longer in the send queue: it waits in the collapsed
+    // "Copiados" section with the text that was copied.
+    expect(section(html, "m1-por-enviar")).not.toContain(`@${handleFor("lead-old")}`);
+    expect(section(html, "m1-copiados")).toContain(`@${handleFor("lead-old")}`);
+    expect(section(html, "m1-copiados")).toContain(`>${m1}</pre>`);
     expect(section(html, "seguimientos")).not.toContain(`@${handleFor("lead-old")}`);
 
     const before = await exportedThread("lead-old");

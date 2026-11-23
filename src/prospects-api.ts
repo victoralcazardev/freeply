@@ -1,7 +1,7 @@
 import { fail, invalid, json, jsonBody, limitParam } from "./api";
 import * as db from "./db";
 import type { Env } from "./index";
-import { registerExpectedM1 } from "./prospects";
+import { closeProspectThread, registerExpectedM1 } from "./prospects";
 
 /**
  * The prospect API the Pi-side CLI and the mobile page talk to.
@@ -86,6 +86,19 @@ function variantId(value: unknown): string | null | Response {
   if (!id) return null;
   if (!/^[A-Z]{1,8}$/.test(id)) return invalid("variant_id", "must be 1-8 characters A-Z");
   return id;
+}
+
+/** The four reasons a thread may be closed by hand (L62). */
+function closeReason(value: unknown): db.ProspectCloseReason | Response {
+  if (typeof value !== "string") return invalid("reason", "must be a string");
+  const reason = value.trim();
+  if (!db.isProspectCloseReason(reason)) {
+    return invalid(
+      "reason",
+      `must be one of ${db.PROSPECT_CLOSE_REASONS.join(", ")}`,
+    );
+  }
+  return reason;
 }
 
 /** Keys that name an account, at any depth of the profile object. */
@@ -250,6 +263,7 @@ export async function handleProspectsApi(
   const path = url.pathname;
 
   if (path === "/api/prospects/threads" && method === "POST") return createThread(request, env);
+  if (path === "/api/prospects/threads/close" && method === "POST") return closeThread(request, env);
   if (path === "/api/prospects/expected-m1" && method === "POST") return registerM1(request, env);
   if (path === "/api/prospects/drafts" && method === "POST") return createDraft(request, env);
   if (path === "/api/prospects/work" && method === "GET") return work(env, url);
@@ -297,9 +311,10 @@ async function createThread(request: Request, env: Env): Promise<Response> {
 
   if (m1Text !== null && existing) {
     // Re-arming an enrolled or closed thread is not a refresh; say so instead of
-    // storing an M1 that could never enroll.
-    if (existing.igsid !== null) return fail(409, "already_enrolled");
+    // storing an M1 that could never enroll. Closed wins over enrolled: a thread
+    // closed after enrolling is permanently out, not merely already paired.
     if (existing.state === "closed") return fail(409, "thread_closed");
+    if (existing.igsid !== null) return fail(409, "already_enrolled");
   }
 
   const name = body.name === undefined ? (existing?.name ?? null) : label(body.name, "name");
@@ -328,6 +343,32 @@ async function createThread(request: Request, env: Env): Promise<Response> {
     return fail(registered.error === "not_found" ? 404 : 409, registered.error);
   }
   return json({ thread: presentThread(registered.thread), created }, status);
+}
+
+/**
+ * Closes a thread by hand: "no le interesa" today, and the other three reasons
+ * the CLI already knows (L62). Valid for any open state, including one the
+ * webhook never enrolled, because the only thing this needs is the `lead_id` the
+ * operator registered.
+ *
+ * A repeated close with the same reason is a no-op and answers `closed: false`;
+ * a different reason is a conflict, so the first answer is never overwritten.
+ * Pending drafts are invalidated by the shared helper, which also drops their
+ * queued retries from the account's outbox.
+ */
+async function closeThread(request: Request, env: Env): Promise<Response> {
+  const body = await jsonBody(request);
+  if (body instanceof Response) return body;
+
+  const leadId = required(body.lead_id, "lead_id");
+  if (leadId instanceof Response) return leadId;
+  const reason = closeReason(body.reason);
+  if (reason instanceof Response) return reason;
+
+  const result = await closeProspectThread(env, { leadId, reason });
+  if (!result.ok) return fail(result.error === "not_found" ? 404 : 409, result.error);
+  if (!result.closed) return json({ closed: false });
+  return json({ closed: true, thread: presentThread(result.thread) });
 }
 
 /**

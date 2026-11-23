@@ -1,7 +1,7 @@
 import { chrome, esc } from "./dashboard";
 import * as db from "./db";
 import type { Env } from "./index";
-import { approveProspectDraft, registerExpectedM1 } from "./prospects";
+import { approveProspectDraft, closeProspectThread, registerExpectedM1 } from "./prospects";
 import type { ProspectBlockCode, ProspectSendOutcome } from "./prospects-send";
 
 /**
@@ -29,11 +29,14 @@ const CSS = `
 .queue { display: grid; gap: .6rem; }
 h2 { margin-top: 1.8rem; }
 .card h3 { font-size: .98rem; margin: 0; font-weight: 600; }
-.card textarea { font-size: 16px; } /* below this iOS zooms the page on focus */
+.card textarea { font-size: 16px; white-space: pre-wrap; } /* below this iOS zooms the page on focus */
+.preview { white-space: pre-wrap; overflow-wrap: anywhere; margin: .4rem 0 0; }
+.offscreen { position: fixed; top: -1000px; left: 0; width: 1px; height: 1px; opacity: 0; }
 .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .6rem; }
 .actions > * { flex: 1 1 9rem; }
 .actions > a { display: flex; }
 .actions button { width: 100%; padding: .6rem .9rem; }
+details.queue > summary { cursor: pointer; }
 `;
 
 /** Spanish for the three ways registering an M1 can fail. */
@@ -112,6 +115,12 @@ const FOLLOWUP_DONE: Record<string, string> = {
 
 const FOLLOWUP_REFUSED = "Ese hilo no está en la cola de seguimientos.";
 
+/** What a manual close answers, by what the shared helper returned. */
+const CLOSE_DONE = "Hilo cerrado: no se le volverá a escribir.";
+const CLOSE_ALREADY = "Ese hilo ya estaba cerrado con ese motivo.";
+const CLOSE_CONFLICT = "Ese hilo está cerrado con otro motivo.";
+const CLOSE_NOT_FOUND = "Ese hilo ya no existe.";
+
 export interface CopiedM1 {
   leadId: string;
   handle: string;
@@ -141,6 +150,9 @@ export async function handleProspectsPage(
   if (url.pathname === "/prospects/followups") {
     return markFollowup(env, field("lead_id"), field("action"));
   }
+  if (url.pathname === "/prospects/close") {
+    return closeThread(env, field("lead_id"), field("reason"));
+  }
   return new Response("not found", { status: 404 });
 }
 
@@ -157,7 +169,7 @@ async function render(
     db.prospectManualQueue(env.DB, now),
     db.prospectWork(env.DB, OVERDUE_LIMIT),
   ]);
-  const copied = extra.copied ?? null;
+  const justCopied = extra.copied ?? null;
   // A lead who wrote and has no draft yet is the CLI's work — until the wait
   // gets long enough that a person has to watch it. From twenty hours it shows
   // in Manual as a warning, and past twenty-four as something only the app can
@@ -167,15 +179,16 @@ async function render(
   return prospectsPage({
     host: url.host,
     now,
-    // The thread just copied is shown as the copy card instead: its box would
-    // otherwise fall back to the CLI's draft, which is not what was sent.
-    pending: copied ? m1.pending.filter((i) => i.thread.leadId !== copied.leadId) : m1.pending,
+    // A copied thread has `m1_registered_at` set, so the queue read already
+    // leaves it out: the next uncopied lead is the first card below.
+    pending: m1.pending,
+    copied: m1.copied,
     unconfirmed: m1.unconfirmed,
     followups,
     drafts,
     manual,
     overdue,
-    copied,
+    justCopied,
     status: extra.status ?? url.searchParams.get("status") ?? undefined,
     error: extra.error ?? url.searchParams.get("error") ?? undefined,
   });
@@ -205,6 +218,27 @@ function sendSaid(send: ProspectSendOutcome): Response {
   if (send.status === "blocked") return problem(SEND_BLOCKED[send.code]);
   if (send.status === "send_state_unknown") return problem(SEND_UNKNOWN);
   return problem(SEND_FAILED);
+}
+
+/**
+ * "No le interesa" on any thread card, and the API's close (`L62`).
+ *
+ * A thread the system never enrolled can finally leave every queue, which is the
+ * gap the first real "no me interesa" exposed: there was no way to record it and
+ * the Sheet would not take a hand-written "perdido". The close is permanent, so
+ * a different reason is refused instead of overwriting the first one.
+ */
+async function closeThread(env: Env, leadId: string, rawReason: string): Promise<Response> {
+  if (leadId === "") return problem(CLOSE_NOT_FOUND);
+  if (!db.isProspectCloseReason(rawReason)) return problem("Motivo desconocido.");
+
+  const result = await closeProspectThread(env, { leadId, reason: rawReason });
+  if (!result.ok) {
+    return problem(result.error === "not_found" ? CLOSE_NOT_FOUND : CLOSE_CONFLICT);
+  }
+  return redirect(
+    `/prospects?status=${encodeURIComponent(result.closed ? CLOSE_DONE : CLOSE_ALREADY)}`,
+  );
 }
 
 /**
@@ -276,7 +310,10 @@ async function decideDraft(
 export interface ProspectsPageData {
   host: string;
   now: number;
+  /** Never copied: the only threads in the send queue, in draft-push order. */
   pending: db.ProspectM1Item[];
+  /** Copied less than 30 min ago; collapsed at the bottom of the M1 queues. */
+  copied: db.ProspectM1Item[];
   unconfirmed: db.ProspectM1Item[];
   /** Enrolled threads with no inbound, and the step due now (T19). */
   followups: db.ProspectFollowupItem[];
@@ -284,7 +321,8 @@ export interface ProspectsPageData {
   manual: db.ProspectManualItem[];
   /** Unanswered inbounds with no draft yet, past the 20 h warning line. */
   overdue: db.ProspectWorkItem[];
-  copied: CopiedM1 | null;
+  /** The thread just copied: the confirmation and the clipboard payload. */
+  justCopied: CopiedM1 | null;
   status?: string;
   error?: string;
 }
@@ -299,7 +337,7 @@ export function prospectsPage(d: ProspectsPageData): Response {
     body: `
       ${d.error ? `<div class="alert">${esc(d.error)}</div>` : ""}
       ${d.status ? `<div class="card" style="border-color:var(--ok)">${esc(d.status)}</div>` : ""}
-      ${d.copied ? copiedCard(d.copied) : ""}
+      ${d.justCopied ? copiedNotice(d.justCopied) : ""}
 
       <section id="m1-por-enviar" class="queue">
         <h2>M1 por enviar <span class="small muted">${d.pending.length}</span></h2>
@@ -317,6 +355,18 @@ export function prospectsPage(d: ProspectsPageData): Response {
             ? empty("Ningún M1 esperando su eco.")
             : d.unconfirmed.map((item) => unconfirmedCard(item, d.now)).join("")
         }
+      </section>
+
+      <section id="m1-copiados" class="queue">
+        <details>
+          <summary><h2>Copiados, esperando confirmación
+            <span class="small muted">${d.copied.length}</span></h2></summary>
+          ${
+            d.copied.length === 0
+              ? empty("Ninguno esperando el eco.")
+              : d.copied.map((item) => copiedWaitingCard(item, d.now)).join("")
+          }
+        </details>
       </section>
 
       <section id="seguimientos" class="queue">
@@ -346,7 +396,8 @@ export function prospectsPage(d: ProspectsPageData): Response {
             ? empty("Nada para enviar a mano.")
             : d.manual.map((item) => manualCard(item, d.now)).join("")
         }
-      </section>`,
+      </section>
+      ${REFRESH_SCRIPT}`,
   });
 }
 
@@ -358,6 +409,22 @@ const empty = (text: string) => `<div class="card muted">${esc(text)}</div>`;
 const chatUrl = (handle: string) => `https://ig.me/m/${encodeURIComponent(handle)}`;
 
 const title = (name: string | null, handle: string) => esc(name ?? `@${handle}`);
+
+/**
+ * "No le interesa" (L62), on every card that still holds a thread.
+ *
+ * A plain POST with the session cookie, like every other form on this page. The
+ * confirm is the browser's own dialog over static text: the label sits next to
+ * the action, and closing is permanent, so one tap is too little.
+ */
+function closeButton(leadId: string): string {
+  return `<form method="post" action="/prospects/close"
+      onsubmit="return confirm('¿Cerrar este hilo como «no le interesa»? No se le volverá a escribir.')">
+    <input type="hidden" name="lead_id" value="${esc(leadId)}">
+    <input type="hidden" name="reason" value="no_interesa">
+    <div class="actions"><button class="danger" type="submit">No le interesa</button></div>
+  </form>`;
+}
 
 /** "hace 21 h" — the only time format the page shows. */
 function ago(ms: number): string {
@@ -404,6 +471,29 @@ function m1Card(item: db.ProspectM1Item, now: number, i: number): string {
     </form>
     <p class="small muted">«Copiar» registra el texto y luego lo copia: el hilo se reconoce solo
       cuando llega el eco de ese texto exacto. Si lo cambias después, vuelve a copiarlo.</p>
+    ${closeButton(thread.leadId)}
+  </div>`;
+}
+
+/** One thread in the collapsed "Copiados" section: copied, echo not back yet. */
+function copiedWaitingCard(item: db.ProspectM1Item, now: number): string {
+  const { thread } = item;
+  return `<div class="card">
+    <div class="row">
+      <h3>${title(thread.name, thread.handle)}</h3>
+      <span class="tag">Copiado hace ${ago(now - (thread.m1RegisteredAt ?? now))}</span>
+    </div>
+    <p class="small muted" style="margin:.15rem 0 .5rem">@${esc(thread.handle)}${
+      thread.nicho ? ` · ${esc(thread.nicho)}` : ""
+    }</p>
+    <p class="small muted">Esperando el eco. Si no llega en 30 min pasa a «M1 sin confirmar».</p>
+    ${
+      item.text
+        ? `<details><summary class="small muted">Ver el texto copiado</summary>
+             <pre class="preview">${esc(item.text)}</pre></details>`
+        : ""
+    }
+    ${closeButton(thread.leadId)}
   </div>`;
 }
 
@@ -424,6 +514,7 @@ function unconfirmedCard(item: db.ProspectM1Item, now: number): string {
       <input type="hidden" name="lead_id" value="${esc(thread.leadId)}">
       <div class="actions"><button class="primary" type="submit">Reintentar</button></div>
     </form>
+    ${closeButton(thread.leadId)}
   </div>`;
 }
 
@@ -458,6 +549,7 @@ function followupCard(item: db.ProspectFollowupItem, i: number): string {
     </form>
     <p class="small muted">El toque no es un DM: comenta o responde a una story desde tu
       cuenta. «Hecho» solo apunta que lo has hecho; no envía nada.</p>
+    ${closeButton(thread.leadId)}
   </div>`;
   }
 
@@ -480,6 +572,7 @@ function followupCard(item: db.ProspectFollowupItem, i: number): string {
     </form>
     <p class="small muted">«Copiar» no guarda ni envía el texto: el mensaje sale de tu móvil.
       «Enviado» apunta el seguimiento para que no se pida dos veces.</p>
+    ${closeButton(thread.leadId)}
   </div>`;
 }
 
@@ -541,6 +634,7 @@ function draftCard(item: db.ProspectQueueItem, now: number, i: number): string {
     <p class="small muted">Aprobar envía el texto final desde el Worker. Si no puede, la página
       dice por qué. A las 24 h del último mensaje del lead la ventana se cierra y ya no se
       puede contestar.</p>
+    ${closeButton(thread.leadId)}
   </div>`;
 }
 
@@ -571,6 +665,7 @@ function overdueCard(item: db.ProspectWorkItem, now: number): string {
         <button type="button">Abrir chat</button>
       </a>
     </div>
+    ${closeButton(thread.leadId)}
   </div>`;
 }
 
@@ -589,7 +684,7 @@ function manualCard(item: db.ProspectManualItem, now: number): string {
         : ""
     }</p>
     ${inbound ? `<p class="small">«${esc(inbound.text)}»</p>` : ""}
-    <p class="small"><b>Para enviar a mano:</b><br>${esc(draft.text)}</p>
+    <p class="small preview"><b>Para enviar a mano:</b><br>${esc(draft.text)}</p>
     <div class="actions">
       <a href="${esc(chatUrl(thread.handle))}" target="_blank" rel="noopener">
         <button type="button">Abrir chat</button>
@@ -613,36 +708,47 @@ function manualCard(item: db.ProspectManualItem, now: number): string {
            reintenta a ciegas: mira el hilo en Instagram y contesta.</p>`
         : ""
     }
+    ${closeButton(thread.leadId)}
   </div>`;
 }
 
 /**
- * What the response to "copiar" shows: the text that was just hashed, next to the
- * chat it has to be pasted into.
+ * The confirmation after "copiar": the thread is registered, the next uncopied
+ * lead is already the first card below, and this one has moved to the collapsed
+ * section at the bottom.
  *
- * The script copies the box's own value rather than a value interpolated into
- * JavaScript: one string literal less to escape, and what the clipboard gets is
- * exactly what the server hashed. `showPicker`-free, dependency-free, and it
- * degrades to a selected box the person can long-press.
+ * The clipboard box is offscreen so focusing it cannot scroll the page away from
+ * the next lead; the visible preview keeps the line breaks the text was written
+ * with. The script copies the box's own value rather than a value interpolated
+ * into JavaScript: one string literal less to escape, and what the clipboard
+ * gets is exactly what the server hashed. `showPicker`-free, dependency-free,
+ * and it degrades to a selected box the person can long-press.
  */
-function copiedCard(c: CopiedM1): string {
+function copiedNotice(c: CopiedM1): string {
   return `<div class="card" style="border-color:var(--ok)">
-    <h3>Copiado${c.name ? ` para ${esc(c.name)}` : ""} — @${esc(c.handle)}</h3>
-    <p class="small muted" style="margin:.15rem 0 .5rem">El texto ya está registrado y en el
-      portapapeles. Abre el chat y pégalo: el hilo se reconoce cuando llegue el eco de este
-      texto exacto.</p>
-    <textarea id="m1-copy" readonly rows="5">${esc(c.text)}</textarea>
+    <div class="row">
+      <h3>Copiado${c.name ? ` para ${esc(c.name)}` : ""} — @${esc(c.handle)}</h3>
+      <span class="tag">En el portapapeles</span>
+    </div>
+    <p class="small muted" style="margin:.15rem 0 .5rem">El texto ya está registrado. Abre el
+      chat y pégalo: el hilo se reconoce cuando llegue el eco de este texto exacto. El siguiente lead
+      está en «M1 por enviar», arriba; este hilo queda en «Copiados, esperando confirmación»,
+      al final.</p>
+    <details><summary class="small muted">Ver el texto copiado</summary>
+      <pre class="preview">${esc(c.text)}</pre>
+    </details>
     <div class="actions">
       <a href="${esc(chatUrl(c.handle))}" target="_blank" rel="noopener">
         <button class="primary" type="button">Abrir chat con @${esc(c.handle)}</button>
       </a>
     </div>
+    <textarea id="m1-copy" readonly class="offscreen">${esc(c.text)}</textarea>
   </div>
   <script>
     (function () {
       var box = document.getElementById("m1-copy");
       if (!box) return;
-      box.focus();
+      if (box.focus) box.focus({ preventScroll: true });
       box.select();
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(box.value).catch(function () {});
@@ -652,3 +758,33 @@ function copiedCard(c: CopiedM1): string {
     })();
   </script>`;
 }
+
+/**
+ * Coming back from Instagram refreshes the page so the queue is current and the
+ * first card is the next uncopied lead.
+ *
+ * Reloading on every return would throw away a draft somebody was editing, so a
+ * touched box disables it for that visit. `pageshow` covers the back-forward
+ * cache, where the DOM is restored without asking the server and the copied lead
+ * would otherwise still be sitting on top.
+ */
+const REFRESH_SCRIPT = `<script>
+    (function () {
+      if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+      var dirty = false;
+      document.addEventListener("input", function (event) {
+        var tag = event.target && event.target.tagName;
+        if (tag === "TEXTAREA" || tag === "INPUT") dirty = true;
+      }, true);
+      function refresh() {
+        if (dirty || document.visibilityState !== "visible") return;
+        window.scrollTo(0, 0);
+        location.reload();
+      }
+      document.addEventListener("visibilitychange", refresh);
+      window.addEventListener("focus", refresh);
+      window.addEventListener("pageshow", function (event) {
+        if (event.persisted) location.reload();
+      });
+    })();
+  </script>`;
