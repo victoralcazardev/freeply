@@ -1,7 +1,7 @@
 import { createExecutionContext, env, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSession, sessionCookie } from "../../src/auth";
-import { prospectAutopilotDueAt } from "../../src/cron";
+import { inProspectSendingHours, prospectAutopilotDueAt } from "../../src/cron";
 import * as db from "../../src/db";
 import worker, { type Env } from "../../src/index";
 import { FIXTURE_SECRETS, IG_USER_ID } from "../fixtures";
@@ -25,6 +25,16 @@ const HOUR = 60 * MINUTE;
 
 /** The trigger this job rides — the one in wrangler.jsonc, not the token one. */
 const CRON = "*/15 * * * *";
+
+/**
+ * The instant every case in this file runs at: a Tuesday at noon in Lisbon.
+ *
+ * The autopilot only sends between 09:00 and 21:00 in Lisbon, so a suite on the
+ * real clock would pass or fail on the hour it happened to run. Only `Date` is
+ * faked here: the pool's own timers and I/O stay real. Cases that need another
+ * hour move the clock themselves, one at a time.
+ */
+const LISBON_NOON = Date.UTC(2025, 6, 15, 11, 0);
 
 function autopilotEnv(value?: string): Env {
   const base = { ...apiEnv } as Env;
@@ -302,6 +312,10 @@ async function getPage(): Promise<string> {
 }
 
 beforeEach(async () => {
+  // Fixed before anything asks what time it is: the account, the drafts and the
+  // authorizations below all have to share one clock.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(LISBON_NOON);
   await env.DB.prepare(`DELETE FROM prospect_authorizations`).run();
   await env.DB.prepare(`DELETE FROM prospect_drafts`).run();
   await env.DB.prepare(`DELETE FROM prospect_messages`).run();
@@ -322,6 +336,7 @@ beforeEach(async () => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 /* ------------------------------------------------------------- the switch */
@@ -334,8 +349,8 @@ describe("the autopilot switch", () => {
   ])("sends nothing when PROSPECT_AUTOPILOT is %s", async (_label, value) => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
-    await pushDraft({ draftId: "draft-1", createdAt: now - 30 * MINUTE });
-    await authorize("draft-1", { at: now - 30 * MINUTE });
+    await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });
+    await authorize("draft-1", { at: now - 45 * MINUTE });
     await setDoSwitch("on");
 
     await runScheduled(autopilotEnv(value));
@@ -351,13 +366,24 @@ describe("the autopilot switch", () => {
 /* --------------------------------------------------------- the human delay */
 
 describe("the human delay", () => {
-  it("spreads due_at over 3 to 12 minutes after the authorization, stable per draft", () => {
+  it("spreads due_at over 5 to 40 minutes after the authorization, stable per draft", () => {
     const authorizedAt = 1_700_000_000_000;
+    // Enough ids that the whole window shows up: the four the old test used all
+    // happened to hash into its top half, which cannot tell 3–12 from 5–40.
+    const delays = Array.from(
+      { length: 200 },
+      (_, i) => prospectAutopilotDueAt({ draftId: `draft-${i}`, authorizedAt }) - authorizedAt,
+    );
+    for (const delay of delays) {
+      expect(delay).toBeGreaterThanOrEqual(5 * MINUTE);
+      expect(delay).toBeLessThanOrEqual(40 * MINUTE);
+    }
+    // Both ends of the window are reachable, not just any range inside it.
+    expect(Math.min(...delays)).toBeLessThan(6 * MINUTE);
+    expect(Math.max(...delays)).toBeGreaterThan(39 * MINUTE);
+    // Same draft, same delay: a cron run must not keep pushing it back.
     for (const draftId of ["draft-a", "draft-b", "draft-c", "draft-zzz"]) {
       const due = prospectAutopilotDueAt({ draftId, authorizedAt });
-      expect(due - authorizedAt).toBeGreaterThanOrEqual(3 * MINUTE);
-      expect(due - authorizedAt).toBeLessThanOrEqual(12 * MINUTE);
-      // Same draft, same delay: a cron run must not keep pushing it back.
       expect(prospectAutopilotDueAt({ draftId, authorizedAt })).toBe(due);
     }
   });
@@ -375,12 +401,12 @@ describe("the human delay", () => {
     expect(calls).toEqual([]);
     expect(await draftStatus("draft-1")).toBe("waiting");
 
-    // Twelve minutes is the longest delay in the window, so past it the draft
-    // is due whatever its id hashes to.
+    // Forty minutes is the longest delay in the window, so past it the draft is
+    // due whatever its id hashes to.
     await env.DB.prepare(
       `UPDATE prospect_authorizations SET created_at = ? WHERE draft_id = 'draft-1'`,
     )
-      .bind(now - 13 * MINUTE)
+      .bind(now - 45 * MINUTE)
       .run();
 
     await runScheduled();
@@ -395,6 +421,58 @@ describe("the human delay", () => {
   });
 });
 
+/* ------------------------------------------------------- the sending window */
+
+describe("the sending window", () => {
+  it.each([
+    // July: Lisbon is UTC+1, so 08:00Z is 09:00 there and 19:59Z is 20:59.
+    ["09:00 summer", Date.UTC(2025, 6, 15, 8, 0), true],
+    ["20:59 summer", Date.UTC(2025, 6, 15, 19, 59), true],
+    ["08:59 summer", Date.UTC(2025, 6, 15, 7, 59), false],
+    ["21:00 summer", Date.UTC(2025, 6, 15, 20, 0), false],
+    // January: UTC+0, so the boundaries sit on the UTC hour.
+    ["09:00 winter", Date.UTC(2025, 0, 15, 9, 0), true],
+    ["20:59 winter", Date.UTC(2025, 0, 15, 20, 59), true],
+    ["08:59 winter", Date.UTC(2025, 0, 15, 8, 59), false],
+    ["21:00 winter", Date.UTC(2025, 0, 15, 21, 0), false],
+  ])("is %s in Lisbon", (_label, at, expected) => {
+    expect(inProspectSendingHours(at)).toBe(expected);
+  });
+
+  it("sends nothing outside the window and sends on the first pass inside it", async () => {
+    // 21:30 in Lisbon: the delay passed hours ago, and the window is shut.
+    vi.setSystemTime(Date.UTC(2025, 6, 15, 20, 30));
+    const now = Date.now();
+    await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
+    await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });
+    // The grant outlives the night: the CLI's gate is about the stage, not the
+    // clock, and the draft waits rather than losing its authorization.
+    await authorize("draft-1", { at: now - 45 * MINUTE, expiresAt: now + 24 * HOUR });
+    await setDoSwitch("on");
+
+    await runScheduled();
+    expect(calls).toEqual([]);
+    expect(await draftStatus("draft-1")).toBe("waiting");
+
+    // 08:59 the next morning: still a minute too early.
+    vi.setSystemTime(Date.UTC(2025, 6, 16, 7, 59));
+    await runScheduled();
+    expect(calls).toEqual([]);
+    expect(await draftStatus("draft-1")).toBe("waiting");
+
+    // 09:00, the first pass inside the window: it goes out, no new grant needed.
+    vi.setSystemTime(Date.UTC(2025, 6, 16, 8, 0));
+    await runScheduled();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain(`/${IG_USER_ID}/messages`);
+    expect(calls[0].body).toEqual({
+      recipient: { id: "peer-1" },
+      message: { text: "Te cuento cómo lo hacemos." },
+    });
+    expect(await draftStatus("draft-1")).toBe("sent");
+  });
+});
+
 /* ------------------------------------------------------ what may be sent */
 
 describe("what the autopilot may send", () => {
@@ -402,7 +480,7 @@ describe("what the autopilot may send", () => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
 
-    const due = now - 30 * MINUTE;
+    const due = now - 45 * MINUTE;
     await pushDraft({ draftId: "draft-none", createdAt: due });
     await pushDraft({ draftId: "draft-expired", createdAt: due });
     await authorize("draft-expired", { at: due, expiresAt: now - 1000 });
@@ -431,7 +509,7 @@ describe("what the autopilot may send", () => {
 
   it("sends at most five drafts per run", async () => {
     const now = Date.now();
-    const due = now - 30 * MINUTE;
+    const due = now - 45 * MINUTE;
     for (let i = 0; i < 7; i++) {
       const leadId = `lead-${i}`;
       await lead({
@@ -458,8 +536,8 @@ describe("what the autopilot may send", () => {
   it("never sends twice to the same thread within five minutes", async () => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
-    await pushDraft({ draftId: "draft-1", createdAt: now - 30 * MINUTE });
-    await authorize("draft-1", { at: now - 30 * MINUTE });
+    await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });
+    await authorize("draft-1", { at: now - 45 * MINUTE });
     await setDoSwitch("on");
 
     await runScheduled();
@@ -471,8 +549,8 @@ describe("what the autopilot may send", () => {
     await deliver(
       inbound({ text: "Vale, ¿y cómo?", peerId: "peer-1", mid: "mid_in_2", at: Date.now() }),
     );
-    await pushDraft({ draftId: "draft-2", createdAt: now - 30 * MINUTE });
-    await authorize("draft-2", { at: now - 30 * MINUTE });
+    await pushDraft({ draftId: "draft-2", createdAt: now - 45 * MINUTE });
+    await authorize("draft-2", { at: now - 45 * MINUTE });
 
     await runScheduled();
     expect(calls).toHaveLength(1);
@@ -493,8 +571,8 @@ describe("what the autopilot may send", () => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
     for (const draftId of ["draft-a", "draft-b"]) {
-      await pushDraft({ draftId, createdAt: now - 30 * MINUTE });
-      await authorize(draftId, { at: now - 30 * MINUTE });
+      await pushDraft({ draftId, createdAt: now - 45 * MINUTE });
+      await authorize(draftId, { at: now - 45 * MINUTE });
     }
     await setDoSwitch("on");
 

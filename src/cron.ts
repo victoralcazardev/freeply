@@ -264,8 +264,8 @@ async function mediaToPoll(campaigns: db.Campaign[], token: string): Promise<str
  */
 
 /** The shortest and the longest a draft waits before the autopilot may send it. */
-export const PROSPECT_AUTOPILOT_MIN_DELAY_MS = 3 * 60_000;
-export const PROSPECT_AUTOPILOT_MAX_DELAY_MS = 12 * 60_000;
+export const PROSPECT_AUTOPILOT_MIN_DELAY_MS = 5 * 60_000;
+export const PROSPECT_AUTOPILOT_MAX_DELAY_MS = 40 * 60_000;
 
 /** Sends per run. A pass every fifteen minutes still leaves the account unhurried. */
 export const PROSPECT_AUTOPILOT_PER_RUN = 5;
@@ -274,7 +274,7 @@ export const PROSPECT_AUTOPILOT_PER_RUN = 5;
 export const PROSPECT_AUTOPILOT_SPACING_MS = 5 * 60_000;
 
 /**
- * When a draft becomes due, between three and twelve minutes after the CLI
+ * When a draft becomes due, between five and forty minutes after the CLI
  * authorized it.
  *
  * The delay runs from the authorization, not from when the draft was written: a
@@ -295,9 +295,40 @@ export function prospectAutopilotDueAt(d: { draftId: string; authorizedAt: numbe
   return d.authorizedAt + PROSPECT_AUTOPILOT_MIN_DELAY_MS + (hash % (spread + 1));
 }
 
+/**
+ * The hours the autopilot may send in, in the operator's own timezone.
+ *
+ * A delay is only human if the hour is too: an Instagram DM at 03:00 is the one
+ * thing a few minutes of jitter cannot fix. Lisbon rather than UTC so the twice
+ * yearly DST change moves the window with the operator — a fixed offset would
+ * send an hour early or late for half the year.
+ */
+const PROSPECT_SENDING_FROM_HOUR = 9;
+const PROSPECT_SENDING_UNTIL_HOUR = 21;
+
+/** The hour of day in Lisbon, whatever UTC happens to be that day. */
+const lisbonHour = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Lisbon",
+  hour: "numeric",
+  hourCycle: "h23",
+});
+
+/**
+ * Whether the autopilot may send at `now` at all: 09:00–21:00 in Lisbon.
+ *
+ * Pure and exported so a test — and the log line that explains a quiet night —
+ * can ask the same question the run asks. Outside the window nothing is read and
+ * nothing is sent: a draft whose delay passed overnight waits for the first pass
+ * inside it rather than going out when nobody is watching.
+ */
+export function inProspectSendingHours(now: number): boolean {
+  const hour = Number(lisbonHour.formatToParts(now).find((p) => p.type === "hour")?.value);
+  return hour >= PROSPECT_SENDING_FROM_HOUR && hour < PROSPECT_SENDING_UNTIL_HOUR;
+}
+
 /** What one pass did, so a test — or a log line — can tell the cases apart. */
 export interface ProspectAutopilotRun {
-  /** Whether the switch let the run look at anything at all. */
+  /** Whether the switch was on; off means the run looked at nothing. */
   enabled: boolean;
   /** Drafts handed to the send path: the number the per-run cap counts. */
   attempted: number;
@@ -326,6 +357,15 @@ export async function prospectAutopilot(
   // could have sent. Nothing below is reachable with autonomy off.
   if (!prospectAutopilotOn(env)) return run;
   run.enabled = true;
+
+  // The sending window, once per run: a run takes seconds, so it cannot close
+  // mid-pass, and a per-message check would only re-ask a question whose answer
+  // changed by nothing. Outside it the pass reads no candidates at all — nothing
+  // is due, nothing is claimed — and the drafts wait for the morning.
+  if (!inProspectSendingHours(now)) {
+    console.log("prospect autopilot: outside 09:00-21:00 Europe/Lisbon, nothing sent");
+    return run;
+  }
 
   // More candidates than the cap, so a few threads still inside their five
   // minutes of spacing do not keep older sendable drafts out of the pass.

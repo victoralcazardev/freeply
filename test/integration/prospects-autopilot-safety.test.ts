@@ -30,6 +30,15 @@ const HOUR = 60 * MINUTE;
 
 const CRON = "*/15 * * * *";
 
+/**
+ * The instant every case here runs at: a Tuesday at noon in Lisbon.
+ *
+ * The autopilot sends only between 09:00 and 21:00 in Lisbon, so a suite on the
+ * real clock would assert "sent" against a cron that was entitled to send
+ * nothing. Only `Date` is faked; the pool's own timers and I/O stay real.
+ */
+const LISBON_NOON = Date.UTC(2025, 6, 15, 11, 0);
+
 /** The switch as the Worker sees it for this run: ("on" | "off" | anything). */
 function runEnv(value?: string): Env {
   const base = { ...apiEnv } as Env;
@@ -287,6 +296,9 @@ async function messages(leadId: string) {
 }
 
 beforeEach(async () => {
+  // Fixed before the account is created, so every row below shares one clock.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(LISBON_NOON);
   await env.DB.prepare(`DELETE FROM prospect_authorizations`).run();
   await env.DB.prepare(`DELETE FROM prospect_drafts`).run();
   await env.DB.prepare(`DELETE FROM prospect_messages`).run();
@@ -306,6 +318,7 @@ beforeEach(async () => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 /* ---------------------------------------------------------------- blocker 1 */
@@ -323,8 +336,8 @@ describe("an autopilot retry is bound to the switch, not to the run that queued 
   ])("does not send the queued retry when the switch is %s", async (_label, value) => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR });
-    await pushDraft({ draftId: "draft-1", createdAt: now - 30 * MINUTE });
-    await authorize("draft-1", { at: now - 30 * MINUTE });
+    await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });
+    await authorize("draft-1", { at: now - 45 * MINUTE });
     await setDoSwitch("on");
     stubMeta(rateLimited);
 
@@ -371,6 +384,32 @@ describe("an autopilot retry is bound to the switch, not to the run that queued 
   });
 });
 
+/* --------------------------------------------------------------- the window */
+
+describe("the sending window is the autopilot's, not the operator's", () => {
+  /**
+   * A person deciding to send is exactly what the window exists for: it governs
+   * the messages nobody decided. Aprobar at midnight has to leave at midnight.
+   */
+  it("sends a draft a person approves outside the window", async () => {
+    vi.setSystemTime(Date.UTC(2025, 6, 15, 23, 0)); // 00:00 in Lisbon.
+    const now = Date.now();
+    await lead({ echoAt: now - 3 * HOUR });
+    await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });
+    await setDoSwitch("on");
+    stubMeta(ok);
+
+    const approved = await approveProspectDraft(runEnv("on"), {
+      draftId: "draft-1",
+      text: "Te cuento cómo lo hacemos.",
+    });
+
+    expect(approved).toMatchObject({ ok: true, send: { status: "sent" } });
+    expect(calls).toHaveLength(1);
+    expect(await draftStatus("draft-1")).toBe("sent");
+  });
+});
+
 /* ---------------------------------------------------------------- blocker 2 */
 
 describe("a refused send is not evidence that a message went out", () => {
@@ -384,8 +423,8 @@ describe("a refused send is not evidence that a message went out", () => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR });
     const told = "Te cuento cómo lo hacemos.";
-    await pushDraft({ draftId: "draft-1", text: told, createdAt: now - 30 * MINUTE });
-    await authorize("draft-1", { at: now - 30 * MINUTE });
+    await pushDraft({ draftId: "draft-1", text: told, createdAt: now - 45 * MINUTE });
+    await authorize("draft-1", { at: now - 45 * MINUTE });
     await setDoSwitch("on");
     stubMeta(rateLimited);
 
@@ -450,8 +489,8 @@ describe("a queued draft is not a sent one", () => {
   it("leaves a queued draft waiting and keeps its retry", async () => {
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR });
-    await pushDraft({ draftId: "draft-1", createdAt: now - 30 * MINUTE });
-    await authorize("draft-1", { at: now - 30 * MINUTE });
+    await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });
+    await authorize("draft-1", { at: now - 45 * MINUTE });
     await setDoSwitch("on");
     stubMeta(rateLimited);
 
@@ -477,8 +516,8 @@ describe("the switch is the exact literal on", () => {
     async (value) => {
       const now = Date.now();
       await lead({ echoAt: now - 3 * HOUR });
-      await pushDraft({ draftId: "draft-1", createdAt: now - 30 * MINUTE });
-      await authorize("draft-1", { at: now - 30 * MINUTE });
+      await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });
+      await authorize("draft-1", { at: now - 45 * MINUTE });
       await setDoSwitch("on");
       stubMeta(ok);
 
@@ -510,12 +549,12 @@ describe("the human delay runs from the authorization", () => {
     expect(calls).toEqual([]);
     expect(await draftStatus("draft-1")).toBe("waiting");
 
-    // Twelve minutes is the longest delay in the window, so past it this draft
+    // Forty minutes is the longest delay in the window, so past it this draft
     // is due whatever its id hashes to.
     await env.DB.prepare(
       `UPDATE prospect_authorizations SET created_at = ? WHERE draft_id = 'draft-1'`,
     )
-      .bind(now - 13 * MINUTE)
+      .bind(now - 45 * MINUTE)
       .run();
 
     await runScheduled("on");
