@@ -78,6 +78,18 @@ const timeout = (): Response => {
   throw new Error("The operation was aborted due to timeout");
 };
 
+/** Meta answered, then the body stopped mid-object: a truncated response. */
+const truncated = (): Response =>
+  new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"message_id":'));
+        controller.error(new Error("connection reset"));
+      },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+
 /* --------------------------------------------------------------- traffic */
 
 async function call(
@@ -174,8 +186,8 @@ async function sessionCookieHeader(): Promise<string> {
   return sessionCookie(session).split(";")[0];
 }
 
-async function getPage(): Promise<string> {
-  const request = new Request("https://freeply.test/prospects", {
+async function getPage(path = "/prospects"): Promise<string> {
+  const request = new Request(`https://freeply.test${path}`, {
     headers: { cookie: await sessionCookieHeader() },
   });
   const ctx = createExecutionContext();
@@ -656,6 +668,41 @@ describe("outcomes that are not a clean send", () => {
     const html = await getPage();
     const manual = section(html, "manual");
     expect(manual).toContain(`@${handleFor("lead-1")}`);
+    expect(manual).toContain('value="sent"');
+    expect(manual).toContain('value="not_sent"');
+  });
+
+  it("treats a body that dies on the first attempt as unknown, not as approved", async () => {
+    const now = Date.now();
+    await lead({ echoAt: now - 3 * HOUR, reply: "Cuéntame más", replyAt: now - HOUR });
+    await pushDraft({});
+    // The approval is the first attempt: Meta answered 200 and the body was cut
+    // short before `message_id` arrived. The request did reach Meta, so nothing
+    // here can prove the DM did not land.
+    stubMeta(truncated);
+
+    const response = await approve("draft-1", "Gracias por responder.");
+    expect(calls).toHaveLength(1);
+    // The page answers with the uncertainty and the manual queue — never with
+    // "it retries by itself", which is what a queued retry says.
+    expect(said(response.location)).toContain("send_state_unknown");
+    expect(said(response.location)).toContain("Manual");
+    expect(said(response.location)).not.toContain("se reintenta solo");
+
+    // Settled as unknown with nothing holding the send. Left `approved` with its
+    // claim and no outbox row, this draft would wait forever with no queue
+    // showing it and no way to settle it.
+    expect((await draftRow("draft-1")).status).toBe("send_state_unknown");
+    expect(await account().claimedDrafts(job("draft-1").dedupeKey)).not.toContain("draft-1");
+    expect(await account().pendingCommentIds()).not.toContain("draft-1");
+
+    // And what the operator lands on after the approval: the manual card, with
+    // its two buttons, not a promise that anything is retrying.
+    const html = await getPage(response.location ?? "/prospects");
+    expect(html).not.toContain("se reintenta solo");
+    const manual = section(html, "manual");
+    expect(manual).toContain(`@${handleFor("lead-1")}`);
+    expect(manual).toContain("Salida sin confirmar");
     expect(manual).toContain('value="sent"');
     expect(manual).toContain('value="not_sent"');
   });
