@@ -30,14 +30,41 @@ const HOUR = 60 * MINUTE;
 
 const CRON = "*/15 * * * *";
 
+/** The hour of day in Lisbon, the way `inProspectSendingHours` reads it. */
+function lisbonHour(at: number): number {
+  return Number(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/Lisbon",
+      hour: "numeric",
+      hourCycle: "h23",
+    }).format(at),
+  );
+}
+
 /**
- * The instant every case here runs at: a Tuesday at noon in Lisbon.
+ * The instant every case here runs at: noon in Lisbon, on the real clock's date.
  *
- * The autopilot sends only between 09:00 and 21:00 in Lisbon, so a suite on the
- * real clock would assert "sent" against a cron that was entitled to send
- * nothing. Only `Date` is faked; the pool's own timers and I/O stay real.
+ * Two constraints pull in opposite directions. The autopilot sends only between
+ * 09:00 and 21:00 in Lisbon, so a suite on the real clock would assert "sent"
+ * against a cron that was entitled to send nothing at 03:00. But only `Date` is
+ * faked: the pool's own timers, and workerd's alarm manager, keep the real
+ * clock. A `Date` pinned in the past leaves the account's `pruneDueAt` and any
+ * queued retry a year behind that real clock, so the alarm the object arms for
+ * them is already overdue — workerd clamps it to now and runs it, `prune` reads
+ * the faked past and doesn't advance, and the object re-arms the same overdue
+ * alarm for as long as the process lives. The cases go green and vitest never
+ * exits.
+ *
+ * Starting from the real instant and moving *forward* by whole hours to Lisbon
+ * noon keeps both: the window is where the cases expect it, and everything the
+ * object schedules — the daily prune, a retry's backoff — still lands after the
+ * instant the alarm manager measures against. A whole number of hours, because
+ * the cases below are written as offsets from this one.
  */
-const LISBON_NOON = Date.UTC(2025, 6, 15, 11, 0);
+const LISBON_NOON = Date.now() + ((12 - lisbonHour(Date.now()) + 24) % 24) * HOUR;
+
+/** Out of the window however the shift landed: 00:00 in Lisbon, that day or the next. */
+const LISBON_MIDNIGHT = LISBON_NOON + 12 * HOUR;
 
 /** The switch as the Worker sees it for this run: ("on" | "off" | anything). */
 function runEnv(value?: string): Env {
@@ -392,7 +419,7 @@ describe("the sending window is the autopilot's, not the operator's", () => {
    * the messages nobody decided. Aprobar at midnight has to leave at midnight.
    */
   it("sends a draft a person approves outside the window", async () => {
-    vi.setSystemTime(Date.UTC(2025, 6, 15, 23, 0)); // 00:00 in Lisbon.
+    vi.setSystemTime(LISBON_MIDNIGHT);
     const now = Date.now();
     await lead({ echoAt: now - 3 * HOUR });
     await pushDraft({ draftId: "draft-1", createdAt: now - 45 * MINUTE });

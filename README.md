@@ -656,9 +656,6 @@ timeout 180 npx vitest run test/integration/prospects-page.test.ts
 ```
 
 - A multi-file `vitest run` of the prospect suites can hang for minutes instead of failing.
-- `test/integration/prospects-autopilot-safety.test.ts` never ends, also on `d0fb34a`: it pins `Date` in
-  2025 with real pool timers, so the Durable Object re-arms an alarm that is already past, forever (cause
-  read from the code, not run to proof). Skip it until the test keeps its fake clock near now.
 - `json-api > answers 404 for every route when API_TOKEN is unset` fails wherever `.dev.vars` defines
   `API_TOKEN`: vitest loads it, so the route answers 401. Environment, not a regression.
 
