@@ -1754,6 +1754,11 @@ export async function decideProspectDraft(
  * unknown send — store nothing; the thread moves in the same batch so a draft
  * written before it is stale exactly as after an echoed owner message.
  *
+ * The text is the one the attempt carried: an approval that ended unknown sent
+ * `decided_text`, not the draft's original wording, so that is what the lead may
+ * have received — and the draft is the only copy of it. `decided_text` is left
+ * as it is for the same reason.
+ *
  * The answer is whether the draft decision won, not whether a message was
  * written: a decision that lost the race writes neither.
  */
@@ -1769,7 +1774,7 @@ export async function decideProspectDraftSent(
     {
       leadId: draft.leadId,
       mid: `manual:${d.draftId}`,
-      text: draft.text,
+      text: draft.decidedText ?? draft.text,
       sentAt: d.decidedAt,
       now: d.decidedAt,
     },
@@ -1779,7 +1784,7 @@ export async function decideProspectDraftSent(
   const results = await db.batch([
     db
       .prepare(
-        `UPDATE prospect_drafts SET status = 'sent', decided_text = NULL, decided_at = ?
+        `UPDATE prospect_drafts SET status = 'sent', decided_at = ?
          WHERE draft_id = ? AND status IN (${d.from.map(() => "?").join(", ")})`,
       )
       .bind(d.decidedAt, d.draftId, ...d.from),

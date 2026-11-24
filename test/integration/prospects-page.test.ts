@@ -297,6 +297,14 @@ const messageCount = async () =>
   (await env.DB.prepare(`SELECT COUNT(*) AS n FROM prospect_messages`).first<{ n: number }>())?.n ??
   0;
 
+/** One stored message's text — the export publishes the row, never its text. */
+async function messageText(mid: string): Promise<string | null> {
+  const row = await env.DB.prepare(`SELECT text FROM prospect_messages WHERE mid = ?`)
+    .bind(mid)
+    .first<{ text: string }>();
+  return row?.text ?? null;
+}
+
 beforeEach(async () => {
   await env.DB.prepare(`DELETE FROM prospect_authorizations`).run();
   await env.DB.prepare(`DELETE FROM prospect_drafts`).run();
@@ -1066,6 +1074,67 @@ describe("POST /prospects/drafts", () => {
     expect(decodeURIComponent(lost.location ?? "")).toContain("ya no está pendiente");
     expect(await messageCount()).toBe(messages + 1);
     expect((await threadRow("lead-1")).version).toBe(version);
+  });
+
+  /**
+   * An approval that ended unknown was attempted with the text the operator
+   * left, not with the draft's (the send path reads `decidedText ?? text`), so
+   * «Salió» has to record that text and keep the only copy of it: it is what
+   * the lead may have received, and nulling it would lose it (JD-A-001).
+   */
+  it("keeps the approved text when «Salió» settles an unknown send", async () => {
+    const now = Date.now();
+    const enrolled = await enrolledLead({
+      leadId: "lead-1",
+      peerId: "peer-1",
+      m1: "Hola, soy Víctor.",
+      at: now - 3 * HOUR,
+    });
+    await leadsReplies({ thread: enrolled, text: "Cuéntame más", at: now - HOUR });
+    await pushDraft({ draftId: "draft-edited", leadId: "lead-1", text: "Gracias por responder." });
+    const edited = "Gracias por responder, Ana. ¿Lo vemos el jueves?";
+
+    // Meta never answered, so nothing proves whether the edited text landed:
+    // the draft waits for a person in the manual queue.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("The operation was aborted due to timeout");
+      }),
+    );
+    const approval = await postPage("/prospects/drafts", {
+      draft_id: "draft-edited",
+      action: "approve",
+      text: edited,
+    });
+    expect(approval.status).toBe(303);
+    expect(decodeURIComponent(approval.location ?? "")).toContain("send_state_unknown");
+    const unknown = await draftRow("draft-edited");
+    expect(unknown.status).toBe("send_state_unknown");
+    expect(unknown.decided_text).toBe(edited);
+
+    const response = await postPage("/prospects/drafts", {
+      draft_id: "draft-edited",
+      action: "sent",
+    });
+    expect(response.status).toBe(303);
+    expect((await draftRow("draft-edited")).status).toBe("sent");
+
+    // The message the page records is the one the attempt carried, and the
+    // draft still holds the text it was sent from.
+    expect(await messageText("manual:draft-edited")).toBe(edited);
+    expect((await draftRow("draft-edited")).decided_text).toBe(edited);
+
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.status).toBe(200);
+    expect(exported.json.messages).toContainEqual(
+      expect.objectContaining({
+        mid: "manual:draft-edited",
+        lead_id: "lead-1",
+        direction: "out",
+        origin: "owner",
+      }),
+    );
   });
 
   it("refuses an action on a draft that already moved on", async () => {
