@@ -304,13 +304,18 @@ async function decideDraft(
   const decision = DECISIONS[action];
   if (!decision) return problem("Acción desconocida.");
 
-  const decided = await db.decideProspectDraft(env.DB, {
-    draftId,
-    from: decision.from,
-    status: decision.status,
-    decidedText: null,
-    decidedAt: decision.status === "waiting" ? null : now,
-  });
+  // «Salió» also stores the message: the operator sent it by hand, so nothing
+  // else records it (S8). Every other button only moves the draft.
+  const decided =
+    decision.status === "sent"
+      ? await db.decideProspectDraftSent(env.DB, { draftId, from: decision.from, decidedAt: now })
+      : await db.decideProspectDraft(env.DB, {
+          draftId,
+          from: decision.from,
+          status: decision.status,
+          decidedText: null,
+          decidedAt: decision.status === "waiting" ? null : now,
+        });
   if (!decided) return problem("Ese borrador ya no está pendiente.");
 
   return redirect(`/prospects?status=${encodeURIComponent(decision.done)}`);

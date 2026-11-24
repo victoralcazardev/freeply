@@ -254,6 +254,7 @@ async function threadRow(leadId: string) {
       m1_sha: string | null;
       m1_registered_at: number | null;
       version: number;
+      last_outbound_at: number | null;
     }>();
   if (!row) throw new Error(`thread ${leadId} not found`);
   return row;
@@ -983,6 +984,88 @@ describe("POST /prospects/drafts", () => {
     const { html } = await getPage("/prospects");
     expect(section(html, "manual")).not.toContain(`@${handleFor("lead-1")}`);
     expect(section(html, "borradores")).not.toContain(`@${handleFor("lead-1")}`);
+  });
+
+  /**
+   * «Salió» is the only record of a reply the operator sent by hand: no API send
+   * wrote it and its echo cannot be told apart from any other message, so the
+   * Sheet kept the thread asking for our reply and the 24 h warning never went
+   * out (S8).
+   */
+  it("records the message when the operator says «Salió»", async () => {
+    const now = Date.now();
+    const enrolled = await enrolledLead({
+      leadId: "lead-1",
+      peerId: "peer-1",
+      m1: "Hola, soy Víctor.",
+      at: now - 40 * HOUR,
+    });
+    await leadsReplies({ thread: enrolled, text: "Cuéntame más", at: now - 25 * HOUR });
+    await pushDraft({ draftId: "draft-1", leadId: "lead-1", text: "Perdona la tardanza." });
+    const before = await threadRow("lead-1");
+    const messages = await messageCount();
+
+    const response = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "sent" });
+    expect(response.status).toBe(303);
+    expect(await messageCount()).toBe(messages + 1);
+
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.status).toBe(200);
+    // A row the Sheet can tell from an echo: our own mid, our own origin.
+    expect(exported.json.messages).toContainEqual(
+      expect.objectContaining({
+        mid: "manual:draft-1",
+        lead_id: "lead-1",
+        direction: "out",
+        origin: "owner",
+      }),
+    );
+
+    const thread = exported.json.threads.find((t: any) => t.lead_id === "lead-1");
+    expect(thread.version).toBe(before.version + 1);
+    const ours = exported.json.messages.filter(
+      (m: any) => m.lead_id === "lead-1" && m.direction === "out",
+    );
+    expect(thread.last_outbound_at).toBe(Math.max(...ours.map((m: any) => m.sent_at)));
+    expect(thread.last_outbound_at).toBeGreaterThan(before.last_outbound_at ?? 0);
+
+    // The rule the Sheet derives "respondió" from: with our message last it is
+    // not asking for our reply any more.
+    const lastIn = Math.max(
+      ...exported.json.messages
+        .filter((m: any) => m.lead_id === "lead-1" && m.direction === "in")
+        .map((m: any) => m.sent_at),
+    );
+    expect(thread.last_outbound_at).toBeGreaterThanOrEqual(lastIn);
+
+    // A second «Salió» writes nothing; neither does one whose decision wins
+    // again, because the `mid` is derived from the draft.
+    const again = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "sent" });
+    expect(again.status).toBe(303);
+    expect(await messageCount()).toBe(messages + 1);
+
+    await env.DB.prepare(
+      `UPDATE prospect_drafts SET status = 'send_state_unknown' WHERE draft_id = 'draft-1'`,
+    ).run();
+    const settled = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "sent" });
+    expect(settled.status).toBe(303);
+    expect((await draftRow("draft-1")).status).toBe("sent");
+    expect(await messageCount()).toBe(messages + 1);
+    expect((await threadRow("lead-1")).version).toBe(before.version + 1);
+
+    // And a decision that lost writes nothing at all: `sent` is also where the
+    // API leaves a draft, so a stale page must not turn that send into this one.
+    await pushDraft({ draftId: "draft-2", leadId: "lead-1", text: "Otra respuesta." });
+    await env.DB.prepare(
+      `UPDATE prospect_drafts SET status = 'sent', decided_at = ? WHERE draft_id = 'draft-2'`,
+    )
+      .bind(now - 1000)
+      .run();
+    const version = (await threadRow("lead-1")).version;
+    const lost = await postPage("/prospects/drafts", { draft_id: "draft-2", action: "sent" });
+    expect(decodeURIComponent(lost.location ?? "")).toContain("ya no está pendiente");
+    expect(await messageCount()).toBe(messages + 1);
+    expect((await threadRow("lead-1")).version).toBe(version);
   });
 
   it("refuses an action on a draft that already moved on", async () => {

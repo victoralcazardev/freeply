@@ -582,6 +582,68 @@ export async function recordProspectInbound(
 }
 
 /**
+ * How a hand-sent message finds its thread: the webhook has the peer id the echo
+ * arrived from, the page only has the draft it is answering.
+ *
+ * The draft form also requires the decision that won, fenced by the timestamp it
+ * wrote: a «Salió» that raced another answer — or that arrives from a page stale
+ * enough for another path to have sent the draft — must not bump the version or
+ * store a message for a send nobody confirmed with this button.
+ */
+type HandSentScope =
+  | { by: "peer"; igUserId: string; igsid: string }
+  | { by: "draft"; draftId: string; decidedAt: number };
+
+/**
+ * The two statements that record a message the account sent outside the API.
+ *
+ * Both are idempotent on the `mid`: the version moves only if no row with that
+ * mid exists yet, and the insert is `INSERT OR IGNORE` on the primary key. The
+ * version moves for the same reason an inbound one does — every draft written
+ * before this message answered a conversation that no longer ends where it did.
+ */
+function handSentStatements(
+  db: D1Database,
+  t: { leadId: string; mid: string; text: string; sentAt: number; now: number },
+  scope: HandSentScope,
+): { thread: D1PreparedStatement; message: D1PreparedStatement } {
+  const where =
+    scope.by === "peer"
+      ? {
+          sql: "ig_user_id = ? AND state = 'enrolled' AND igsid = ?",
+          binds: [scope.igUserId, scope.igsid],
+        }
+      : {
+          sql:
+            "state = 'enrolled' AND EXISTS (SELECT 1 FROM prospect_drafts " +
+            "WHERE draft_id = ? AND status = 'sent' AND decided_at = ?)",
+          binds: [scope.draftId, scope.decidedAt],
+        };
+
+  return {
+    thread: db
+      .prepare(
+        `UPDATE prospect_threads
+         SET version = version + 1, last_outbound_at = ?, updated_at = ?
+         WHERE lead_id = ? AND ${where.sql}
+           AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)`,
+      )
+      .bind(t.sentAt, t.now, t.leadId, ...where.binds, t.mid),
+    message: db
+      .prepare(
+        `INSERT OR IGNORE INTO prospect_messages
+           (mid, lead_id, direction, origin, text, sent_at, created_at)
+         SELECT ?, ?, 'out', 'owner', ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM prospect_threads
+           WHERE lead_id = ? AND ${where.sql}
+         )`,
+      )
+      .bind(t.mid, t.leadId, t.text, t.sentAt, t.now, t.leadId, ...where.binds),
+  };
+}
+
+/**
  * Stores a message the operator typed on his phone and freezes the conversation
  * around it.
  *
@@ -608,15 +670,13 @@ export async function recordProspectOwnerMessage(
   },
 ): Promise<boolean> {
   const now = Date.now();
+  const sent = handSentStatements(
+    db,
+    { leadId: t.leadId, mid: t.mid, text: t.text, sentAt: t.sentAt, now },
+    { by: "peer", igUserId: t.igUserId, igsid: t.igsid },
+  );
   const results = await db.batch([
-    db
-      .prepare(
-        `UPDATE prospect_threads
-         SET version = version + 1, last_outbound_at = ?, updated_at = ?
-         WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled' AND igsid = ?
-           AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)`,
-      )
-      .bind(t.sentAt, now, t.leadId, t.igUserId, t.igsid, t.mid),
+    sent.thread,
     db
       .prepare(
         `UPDATE prospect_drafts SET status = 'invalidated'
@@ -624,17 +684,7 @@ export async function recordProspectOwnerMessage(
            AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)`,
       )
       .bind(t.leadId, t.mid),
-    db
-      .prepare(
-        `INSERT OR IGNORE INTO prospect_messages
-           (mid, lead_id, direction, origin, text, sent_at, created_at)
-         SELECT ?, ?, 'out', 'owner', ?, ?, ?
-         WHERE EXISTS (
-           SELECT 1 FROM prospect_threads
-           WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled' AND igsid = ?
-         )`,
-      )
-      .bind(t.mid, t.leadId, t.text, t.sentAt, now, t.leadId, t.igUserId, t.igsid),
+    sent.message,
   ]);
 
   return (results[0]?.meta.changes ?? 0) > 0;
@@ -1691,6 +1741,53 @@ export async function decideProspectDraft(
     .run();
 
   return (result.meta.changes ?? 0) > 0;
+}
+
+/**
+ * «Salió»: marks the draft sent and records the message it was sent from.
+ *
+ * A reply the operator sends by hand leaves no other trace. No API send records
+ * it, and its echo cannot be told from any other message in the conversation, so
+ * without this the Sheet keeps the thread as "respondió / contestar" and the
+ * 24 h warning never goes out (S8). The `mid` is derived from the draft, which
+ * is what makes a repeat — including one whose decision wins again after an
+ * unknown send — store nothing; the thread moves in the same batch so a draft
+ * written before it is stale exactly as after an echoed owner message.
+ *
+ * The answer is whether the draft decision won, not whether a message was
+ * written: a decision that lost the race writes neither.
+ */
+export async function decideProspectDraftSent(
+  db: D1Database,
+  d: { draftId: string; from: readonly ProspectDraftStatus[]; decidedAt: number },
+): Promise<boolean> {
+  const draft = await getProspectDraft(db, d.draftId);
+  if (draft === null) return false;
+
+  const sent = handSentStatements(
+    db,
+    {
+      leadId: draft.leadId,
+      mid: `manual:${d.draftId}`,
+      text: draft.text,
+      sentAt: d.decidedAt,
+      now: d.decidedAt,
+    },
+    { by: "draft", draftId: d.draftId, decidedAt: d.decidedAt },
+  );
+
+  const results = await db.batch([
+    db
+      .prepare(
+        `UPDATE prospect_drafts SET status = 'sent', decided_text = NULL, decided_at = ?
+         WHERE draft_id = ? AND status IN (${d.from.map(() => "?").join(", ")})`,
+      )
+      .bind(d.decidedAt, d.draftId, ...d.from),
+    sent.thread,
+    sent.message,
+  ]);
+
+  return (results[0]?.meta.changes ?? 0) > 0;
 }
 
 /** The lead's latest message, per thread — the one a reply has to answer. */
