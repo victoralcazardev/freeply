@@ -595,12 +595,37 @@ type HandSentScope =
   | { by: "draft"; draftId: string; decidedAt: number };
 
 /**
+ * The echo of a reply «Salió» already recorded.
+ *
+ * The page stores the message the operator sent by hand the moment he confirms
+ * it, because no API send and no other row will ever say it went out, and gives
+ * it a mid of its own (`manual:<draft_id>`). Meta's copy arrives later with a
+ * mid nothing here has seen, so by mid alone it is a second message: two
+ * outbound rows and two version bumps for a DM the lead saw once. The one thing
+ * that says it is the same DM is that the manual row is still the thread's last
+ * message — anything recorded after it means the operator may have written the
+ * same words again, and then it is stored as its own message.
+ *
+ * Two binds: the lead, and the text that has to match.
+ */
+const NOT_THE_ECHO_OF_A_HAND_SENT_REPLY = `NOT EXISTS (
+           SELECT 1 FROM prospect_messages m
+           WHERE m.mid = (SELECT x.mid FROM prospect_messages x
+                          WHERE x.lead_id = ?
+                          ORDER BY x.sent_at DESC, x.mid DESC LIMIT 1)
+             AND m.direction = 'out' AND m.mid LIKE 'manual:%' AND m.text = ?
+         )`;
+
+/**
  * The two statements that record a message the account sent outside the API.
  *
  * Both are idempotent on the `mid`: the version moves only if no row with that
  * mid exists yet, and the insert is `INSERT OR IGNORE` on the primary key. The
  * version moves for the same reason an inbound one does — every draft written
  * before this message answered a conversation that no longer ends where it did.
+ *
+ * The echo form also refuses the copy of a message the page already recorded:
+ * see `NOT_THE_ECHO_OF_A_HAND_SENT_REPLY`.
  */
 function handSentStatements(
   db: D1Database,
@@ -610,8 +635,10 @@ function handSentStatements(
   const where =
     scope.by === "peer"
       ? {
-          sql: "ig_user_id = ? AND state = 'enrolled' AND igsid = ?",
-          binds: [scope.igUserId, scope.igsid],
+          sql:
+            "ig_user_id = ? AND state = 'enrolled' AND igsid = ? AND " +
+            NOT_THE_ECHO_OF_A_HAND_SENT_REPLY,
+          binds: [scope.igUserId, scope.igsid, t.leadId, t.text],
         }
       : {
           sql:
@@ -656,7 +683,10 @@ function handSentStatements(
  *
  * The `NOT EXISTS` guard is by `mid`, so a redelivery writes nothing at all. It
  * is checked before the insert below rather than after, because statements in a
- * batch run in order.
+ * batch run in order. The second guard is the other way the same DM arrives
+ * twice: «Salió» stored it under a mid of the page's own, and the echo carries
+ * Meta's. That statement writes no row and no version — see
+ * `NOT_THE_ECHO_OF_A_HAND_SENT_REPLY`.
  */
 export async function recordProspectOwnerMessage(
   db: D1Database,
@@ -677,13 +707,17 @@ export async function recordProspectOwnerMessage(
   );
   const results = await db.batch([
     sent.thread,
+    // Guarded like the two above: an echo that writes nothing must retire
+    // nothing either, or a draft written after the manual row is dropped over a
+    // message the thread already held.
     db
       .prepare(
         `UPDATE prospect_drafts SET status = 'invalidated'
          WHERE lead_id = ? AND status IN ('waiting', 'approved')
-           AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)`,
+           AND NOT EXISTS (SELECT 1 FROM prospect_messages WHERE mid = ?)
+           AND ${NOT_THE_ECHO_OF_A_HAND_SENT_REPLY}`,
       )
-      .bind(t.leadId, t.mid),
+      .bind(t.leadId, t.mid, t.leadId, t.text),
     sent.message,
   ]);
 

@@ -293,9 +293,23 @@ async function pushDraft(o: {
   expect(created.status).toBe(201);
 }
 
+/** The account's Durable Object, where a send's claim lives while it is in flight. */
+const account = () => env.ACCOUNT.get(env.ACCOUNT.idFromName(IG_USER_ID));
+
 const messageCount = async () =>
   (await env.DB.prepare(`SELECT COUNT(*) AS n FROM prospect_messages`).first<{ n: number }>())?.n ??
   0;
+
+/** How many outbound rows this lead holds with that exact text. */
+async function outboundWithText(leadId: string, text: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM prospect_messages
+     WHERE lead_id = ? AND direction = 'out' AND text = ?`,
+  )
+    .bind(leadId, text)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
 
 /** One stored message's text — the export publishes the row, never its text. */
 async function messageText(mid: string): Promise<string | null> {
@@ -312,6 +326,10 @@ beforeEach(async () => {
   await env.DB.prepare(`DELETE FROM prospect_threads`).run();
   await env.DB.prepare(`DELETE FROM sends`).run();
   await env.DB.prepare(`DELETE FROM accounts`).run();
+  // Claims outlive a test in this pool, so they have to go with the rows they
+  // referred to: a held claim on a reused draft id makes a later echo look like
+  // the copy of an API send that never happened.
+  await account().clear();
   await db.upsertAccount(env.DB, env.ENCRYPTION_KEY, {
     igUserId: IG_USER_ID,
     username: "victoralcazar",
@@ -1074,6 +1092,117 @@ describe("POST /prospects/drafts", () => {
     expect(decodeURIComponent(lost.location ?? "")).toContain("ya no está pendiente");
     expect(await messageCount()).toBe(messages + 1);
     expect((await threadRow("lead-1")).version).toBe(version);
+  });
+
+  /**
+   * The button has to record the message before Meta's copy of it arrives, so
+   * one DM ends up with two identities: the `manual:<draft_id>` the page wrote
+   * and the mid the webhook carries. Storing the echo as well would leave two
+   * outbound rows and two version bumps for a message the lead saw once, and
+   * every draft would be retired twice over a conversation that never moved
+   * (JD-B-002).
+   */
+  it("ignores the echo of the message «Salió» already recorded", async () => {
+    const now = Date.now();
+    const enrolled = await enrolledLead({
+      leadId: "lead-1",
+      peerId: "peer-1",
+      m1: "Hola, soy Víctor.",
+      at: now - 40 * HOUR,
+    });
+    await leadsReplies({ thread: enrolled, text: "Cuéntame más", at: now - 25 * HOUR });
+    const told = "Perdona la tardanza, te cuento ahora mismo.";
+    await pushDraft({ draftId: "draft-1", leadId: "lead-1", text: told });
+
+    const response = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "sent" });
+    expect(response.status).toBe(303);
+    expect(await outboundWithText("lead-1", told)).toBe(1);
+    const decided = await threadRow("lead-1");
+
+    // The same DM coming back as an echo, with a mid nothing here has seen.
+    const at = now + 1000;
+    await deliver(echo({ text: told, peerId: "peer-1", mid: "mid_echo_manual_1", at }));
+
+    // One message, one row, one version — and the row is still the page's.
+    expect(await outboundWithText("lead-1", told)).toBe(1);
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.status).toBe(200);
+    expect(
+      exported.json.messages.filter(
+        (m: any) => m.lead_id === "lead-1" && m.direction === "out",
+      ),
+    ).toEqual([
+      expect.objectContaining({ mid: "mid_echo_lead-1", origin: "echo_m1" }),
+      expect.objectContaining({ mid: "manual:draft-1", origin: "owner" }),
+    ]);
+    const thread = exported.json.threads.find((t: any) => t.lead_id === "lead-1");
+    expect(thread.version).toBe(decided.version);
+    expect(thread.last_outbound_at).toBe(decided.last_outbound_at);
+
+    // A redelivery of that echo still writes nothing at all.
+    await deliver(echo({ text: told, peerId: "peer-1", mid: "mid_echo_manual_1", at }));
+    expect(await outboundWithText("lead-1", told)).toBe(1);
+    expect((await threadRow("lead-1")).version).toBe(decided.version);
+  });
+
+  /**
+   * The guard is about one DM seen twice, not about the text: a different
+   * message the operator types after «Salió» has no other way of being stored.
+   */
+  it("still records an echo whose text «Salió» never recorded", async () => {
+    const now = Date.now();
+    const enrolled = await enrolledLead({
+      leadId: "lead-1",
+      peerId: "peer-1",
+      m1: "Hola, soy Víctor.",
+      at: now - 40 * HOUR,
+    });
+    await leadsReplies({ thread: enrolled, text: "Cuéntame más", at: now - 25 * HOUR });
+    await pushDraft({ draftId: "draft-1", leadId: "lead-1", text: "Perdona la tardanza." });
+
+    const response = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "sent" });
+    expect(response.status).toBe(303);
+    const decided = await threadRow("lead-1");
+
+    const typed = "Te paso los detalles por aquí.";
+    const at = now + 1000;
+    await deliver(echo({ text: typed, peerId: "peer-1", mid: "mid_owner_after", at }));
+
+    expect(await outboundWithText("lead-1", typed)).toBe(1);
+    const after = await threadRow("lead-1");
+    expect(after.version).toBe(decided.version + 1);
+    expect(after.last_outbound_at).toBe(at);
+  });
+
+  /**
+   * The same text after the lead has written back is a second message, not a
+   * duplicate: the manual row is no longer the last thing in the conversation,
+   * so nothing proves the echo is the one «Salió» already stored.
+   */
+  it("records the same text again once the lead has written back", async () => {
+    const now = Date.now();
+    const enrolled = await enrolledLead({
+      leadId: "lead-1",
+      peerId: "peer-1",
+      m1: "Hola, soy Víctor.",
+      at: now - 40 * HOUR,
+    });
+    await leadsReplies({ thread: enrolled, text: "Cuéntame más", at: now - 25 * HOUR });
+    const told = "Perdona la tardanza, te cuento ahora mismo.";
+    await pushDraft({ draftId: "draft-1", leadId: "lead-1", text: told });
+
+    const response = await postPage("/prospects/drafts", { draft_id: "draft-1", action: "sent" });
+    expect(response.status).toBe(303);
+    await leadsReplies({ thread: enrolled, text: "Vale, ¿y el precio?", at: now + 500 });
+    const replied = await threadRow("lead-1");
+
+    const at = now + 1000;
+    await deliver(echo({ text: told, peerId: "peer-1", mid: "mid_owner_again", at }));
+
+    expect(await outboundWithText("lead-1", told)).toBe(2);
+    const after = await threadRow("lead-1");
+    expect(after.version).toBe(replied.version + 1);
+    expect(after.last_outbound_at).toBe(at);
   });
 
   /**
