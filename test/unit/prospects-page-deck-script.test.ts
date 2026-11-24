@@ -473,3 +473,42 @@ describe("probe: DECK_SCRIPT behaviour", () => {
     expect(root.querySelectorAll("section[data-queue]").filter((s) => !s.hidden).map((s) => s.attrs["data-queue"])).toEqual(["m1"]);
   });
 });
+
+describe("deck: native close ordering", () => {
+  it("keeps focus on the chosen card when close fires asynchronously, then resets landing", async () => {
+    const { root, doc, focus } = harness(await render(fullPage()));
+    const sheet: any = root.querySelector("dialog")!;
+    const opener = root.querySelector("[data-queue-open]")!;
+    sheet.showModal = function () { this.open = true; this.setAttribute("open", ""); };
+    sheet.close = function () {
+      this.open = false; this.removeAttribute("open"); opener.focus();
+      setTimeout(() => this.dispatch("close", {}), 0);
+    };
+    opener.dispatch("click", {});
+    root.querySelectorAll("[data-queue-link]").find((l) => l.attrs["data-queue-link"] === "manual")!.dispatch("click", {});
+    const manual = root.querySelectorAll("section[data-queue]").find((s) => s.getAttribute("data-queue") === "manual")!;
+    expect(focus()).toBe(manual.querySelector("h3"));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(focus()).toBe(manual.querySelector("h3"));
+    opener.dispatch("click", {});
+    sheet.close = function () { this.open = false; this.removeAttribute("open"); setTimeout(() => this.dispatch("close", {}), 0); };
+    doc.fire("keydown", { key: "Escape", target: root });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(focus()).toBe(opener);
+  });
+
+  it("resets landing on the fallback path with no close()", async () => {
+    const { root, doc, focus } = harness(await render(fullPage()));
+    const sheet: any = root.querySelector("dialog")!;
+    const opener = root.querySelector("[data-queue-open]")!;
+    sheet.showModal = function () { this.open = true; this.setAttribute("open", ""); };
+    delete sheet.close;
+    opener.dispatch("click", {});
+    root.querySelectorAll("[data-queue-link]").find((l) => l.attrs["data-queue-link"] === "manual")!.dispatch("click", {});
+    const manual = root.querySelectorAll("section[data-queue]").find((s) => s.getAttribute("data-queue") === "manual")!;
+    expect(focus()).toBe(manual.querySelector("h3"));
+    opener.dispatch("click", {});
+    doc.fire("keydown", { key: "Escape", target: root });
+    expect(focus()).toBe(opener);
+  });
+});
