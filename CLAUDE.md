@@ -243,7 +243,7 @@ Don't report success until a DM has landed in a real inbox.
 ## Working on the code
 
 ```bash
-npm test            # 161 tests, workerd + real D1 + a real Durable Object
+npm test            # 350+ tests, workerd + real D1 + a real Durable Object
 npm run typecheck
 ```
 

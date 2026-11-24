@@ -136,6 +136,8 @@ textarea { font-size: 16px; white-space: pre-wrap; } /* below 16px iOS zooms the
 .deck-open { min-height: 44px; padding: 0 .9rem; border-radius: 999px;
   border: 1px solid var(--fx-line-2); background: var(--card); color: var(--fg);
   font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer; }
+.deck-queue { font-size: .85rem; font-weight: 650; color: var(--fg); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
 .deck-pos { margin-left: auto; font-size: .8rem; font-weight: 650; color: var(--muted);
   font-variant-numeric: tabular-nums; }
 .deck-hint { max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -997,6 +999,7 @@ function deckChrome(active: QueueSection): string {
     <div class="deck-bar">
       <button class="deck-open" type="button" data-queue-open aria-haspopup="dialog"
         aria-expanded="false">Colas</button>
+      <span class="deck-queue" data-queue-name>${esc(active.title)}</span>
       <span class="deck-pos" data-pos aria-live="polite">${position}</span>
       <span class="deck-hint" data-hint></span>
     </div>
@@ -1050,7 +1053,7 @@ function queueSheet(sections: QueueSection[], active: QueueSection): string {
 /** One queue's section: a heading, its count, and every card it holds. */
 function queueSection(section: QueueSection): string {
   return `<section id="${section.id}" class="queue" data-queue="${section.key}"
-      data-queue-count="${section.count}">
+      data-queue-count="${section.count}" data-queue-title="${esc(section.title)}">
     <h2>${esc(section.title)} <span class="small muted">${section.count}</span></h2>
     ${section.cards}${section.count === 0 ? empty(section.empty) : ""}
   </section>`;
@@ -1147,6 +1150,9 @@ const DECK_SCRIPT = `<script>
       var count = root.querySelector("[data-count]");
       var fill = root.querySelector("[data-fill]");
       var hint = root.querySelector("[data-hint]");
+      var qname = root.querySelector("[data-queue-name]");
+      // Set while a queue link closes the sheet: focus goes to the new card, not back to «Colas».
+      var landing = false;
       var prev = root.querySelector("[data-prev]");
       var next = root.querySelector("[data-next]");
       var sheet = document.getElementById("queue-sheet");
@@ -1175,6 +1181,7 @@ const DECK_SCRIPT = `<script>
           cards[c].hidden = c !== index;
         }
         var total = cards.length;
+        if (qname) qname.textContent = section.getAttribute("data-queue-title") || "";
         if (pos) pos.textContent = total === 0 ? "Nada pendiente" : (index + 1) + " de " + total;
         if (count) count.textContent = total === 0 ? "—" : (index + 1) + " / " + total;
         if (fill) fill.style.width = total === 0 ? "0" : Math.round(((index + 1) / total) * 100) + "%";
@@ -1215,9 +1222,16 @@ const DECK_SCRIPT = `<script>
         if (typeof sheet.close === "function") sheet.close();
         else {
           sheet.removeAttribute("open");
-          if (opener) opener.focus();
+          afterClose();
         }
         if (opener) opener.setAttribute("aria-expanded", "false");
+      }
+      function afterClose() {
+        if (opener) {
+          opener.setAttribute("aria-expanded", "false");
+          if (!landing) opener.focus();
+        }
+        landing = false;
       }
 
       if (prev) prev.addEventListener("click", function () { index -= 1; draw(true); });
@@ -1226,12 +1240,7 @@ const DECK_SCRIPT = `<script>
       if (sheet) {
         // A native dialog returns focus on its own; taking it back explicitly
         // keeps the fallback path and the modal path behaving the same.
-        sheet.addEventListener("close", function () {
-          if (opener) {
-            opener.setAttribute("aria-expanded", "false");
-            opener.focus();
-          }
-        });
+        sheet.addEventListener("close", afterClose);
         sheet.addEventListener("click", function (event) {
           if (event.target === sheet) closeSheet();
         });
@@ -1242,8 +1251,10 @@ const DECK_SCRIPT = `<script>
         var links = sheet.querySelectorAll("[data-queue-link]");
         for (var q = 0; q < links.length; q++) {
           links[q].addEventListener("click", function () {
-            choose(this.getAttribute("data-queue-link"));
+            var name = this.getAttribute("data-queue-link");
+            landing = true;
             closeSheet();
+            choose(name);
           });
         }
       }

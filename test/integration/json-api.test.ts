@@ -53,7 +53,9 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("auth", () => {
   it("answers 404 for every route when API_TOKEN is unset", async () => {
-    const r = await call("GET", "/api/accounts", undefined, { env });
+    // Forced unset: an operator's .dev.vars may set API_TOKEN in the ambient env.
+    const { API_TOKEN: _unset, ...withoutToken } = env as typeof env & { API_TOKEN?: string };
+    const r = await call("GET", "/api/accounts", undefined, { env: withoutToken as typeof env });
     expect(r.status).toBe(404);
     const empty = await call("GET", "/api/campaigns", undefined, { env: { ...env, API_TOKEN: "" } });
     expect(empty.status).toBe(404);

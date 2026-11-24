@@ -431,6 +431,22 @@ describe("probe: DECK_SCRIPT behaviour", () => {
     expect(sheet.open).toBe(false);
   });
 
+  it("lands on the chosen queue's card and names the queue, not back on «Colas»", async () => {
+    const { root, focus } = harness(await render(fullPage()));
+    const sheet: any = root.querySelector("dialog")!;
+    sheet.showModal = function () { this.open = true; this.setAttribute("open", ""); };
+    sheet.close = function () { this.open = false; this.removeAttribute("open"); this.dispatch("close", {}); };
+    const name = root.querySelector("[data-queue-name]")!;
+    const drafts = root.querySelectorAll("section[data-queue]").find((s) => s.getAttribute("data-queue") === "drafts")!;
+    expect(name.textContent).toBe(drafts.getAttribute("data-queue-title"));
+    root.querySelector("[data-queue-open]")!.dispatch("click", {});
+    root.querySelectorAll("[data-queue-link]").find((l) => l.attrs["data-queue-link"] === "manual")!.dispatch("click", {});
+    const manual = root.querySelectorAll("section[data-queue]").find((s) => s.getAttribute("data-queue") === "manual")!;
+    expect(name.textContent).toBe(manual.getAttribute("data-queue-title"));
+    expect(name.textContent).not.toBe("");
+    expect(focus()).toBe(manual.querySelector("h3"));
+  });
+
   it("runs without a card and without a queue to page", async () => {
     const page = await render(data({}));
     expect(page).toContain("No hay nada pendiente");
