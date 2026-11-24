@@ -468,8 +468,10 @@ export async function enrolledThreadByIgsid(
  *
  * The update is conditioned on the state and version read before it, so a
  * duplicate delivery cannot enroll twice or bump the conversation version twice.
- * The message insert only fires if that update won the race, and `mid` dedupes a
- * redelivery even then.
+ * Everything after it is guarded on that update having won the race, and the
+ * message insert dedupes a redelivery even then. The M1 draft is closed here
+ * because nobody else would: a copied M1 is sent by hand, so no API send ever
+ * records it and the CLI kept counting it as work still pending (S3).
  */
 export async function enrollProspectThread(
   db: D1Database,
@@ -497,6 +499,18 @@ export async function enrollProspectThread(
       // `enrolled_at` is the echo's own timestamp, which is when the operator
       // sent the M1 — the moment the follow-up days count from (T19).
       .bind(t.igsid, t.sentAt, t.sentAt, now, t.leadId, t.igUserId, t.expectedVersion),
+    // `decided_at` is the echo's own timestamp: when the operator sent it.
+    db
+      .prepare(
+        `UPDATE prospect_drafts SET status = 'sent', decided_at = ?
+         WHERE lead_id = ? AND kind = 'm1' AND status = 'waiting'
+           AND EXISTS (
+             SELECT 1 FROM prospect_threads
+             WHERE lead_id = ? AND ig_user_id = ? AND state = 'enrolled'
+               AND igsid = ? AND version = ?
+           )`,
+      )
+      .bind(t.sentAt, t.leadId, t.leadId, t.igUserId, t.igsid, nextVersion),
     db
       .prepare(
         `INSERT OR IGNORE INTO prospect_messages

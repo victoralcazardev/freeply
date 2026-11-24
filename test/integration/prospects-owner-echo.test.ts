@@ -191,7 +191,7 @@ async function threadRow(leadId: string) {
 async function draftRow(draftId: string) {
   const row = await env.DB.prepare(`SELECT * FROM prospect_drafts WHERE draft_id = ?`)
     .bind(draftId)
-    .first<{ status: string }>();
+    .first<{ status: string; decided_at: number | null }>();
   if (!row) throw new Error(`draft ${draftId} not found`);
   return row;
 }
@@ -251,6 +251,97 @@ afterEach(() => {
 });
 
 /* ------------------------------------------------------------------ tests */
+
+/**
+ * The M1 is sent by hand, so no API send ever records it and its draft would sit
+ * in `waiting` for good — the CLI counted those as work still pending (T10, S3).
+ * The echo that enrolls the thread is the proof it went out, and it closes the
+ * draft in the same write.
+ */
+describe("the M1 echo that enrolls a thread", () => {
+  it("closes the lead's waiting M1 draft", async () => {
+    const now = Date.now();
+    const echoAt = now - 3 * HOUR;
+    await enrolledLead({ echoAt });
+
+    const exported = await call("GET", "/api/prospects/export");
+    expect(exported.status).toBe(200);
+    expect((await exported.json()).drafts).toEqual([
+      expect.objectContaining({
+        draft_id: "m1_lead-1",
+        lead_id: "lead-1",
+        kind: "m1",
+        status: "sent",
+        // The moment the operator's phone sent it, as `enrolled_at` already is.
+        decided_at: echoAt,
+      }),
+    ]);
+  });
+
+  /**
+   * The close rides on the enrollment update winning. An echo whose registration
+   * was read before the thread moved on enrolls nothing, so it must decide
+   * nothing either — otherwise a draft nobody sent would look sent.
+   */
+  it("decides no draft when the enrollment does not win", async () => {
+    const now = Date.now();
+    const leadId = "lead-1";
+    const m1 = "Hola, soy Víctor.";
+    expect(
+      (
+        await call("POST", "/api/prospects/threads", {
+          lead_id: leadId,
+          handle: handleFor(leadId),
+          name: null,
+          nicho: null,
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await call("POST", "/api/prospects/drafts", {
+          draft_id: `m1_${leadId}`,
+          lead_id: leadId,
+          kind: "m1",
+          stage: "M1",
+          text: m1,
+          base_version: 0,
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (await call("POST", "/api/prospects/expected-m1", { lead_id: leadId, text: m1 })).status,
+    ).toBe(200);
+
+    const echo = {
+      leadId,
+      igUserId: IG_USER_ID,
+      igsid: "peer-1",
+      mid: "mid_echo_1",
+      text: m1,
+      sentAt: now,
+    };
+    const stale = (await threadRow(leadId)).version + 1;
+    expect(await db.enrollProspectThread(env.DB, { ...echo, expectedVersion: stale })).toBe(false);
+    expect(await threadRow(leadId)).toMatchObject({ state: "m1_pendiente", igsid: null });
+    expect(await draftRow(`m1_${leadId}`)).toMatchObject({
+      status: "waiting",
+      decided_at: null,
+    });
+
+    // The version the registration actually read enrolls, and closes the draft.
+    expect(await db.enrollProspectThread(env.DB, { ...echo, expectedVersion: stale - 1 })).toBe(
+      true,
+    );
+    const decided = await draftRow(`m1_${leadId}`);
+    expect(decided.status).toBe("sent");
+
+    // A redelivery cannot enroll a second time, so it cannot decide it again.
+    const before = (await threadRow(leadId)).version;
+    expect(await db.enrollProspectThread(env.DB, { ...echo, expectedVersion: before })).toBe(false);
+    expect((await draftRow(`m1_${leadId}`)).decided_at).toBe(decided.decided_at);
+  });
+});
 
 describe("an echo on an enrolled thread", () => {
   it("stores it as the operator's message and retires every pending draft", async () => {
