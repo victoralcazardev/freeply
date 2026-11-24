@@ -112,15 +112,29 @@ export function extractProspectEvents(payload: ProspectWebhookPayload): Prospect
  * nothing, and the only log is a content-free counter — never the text, the
  * sender, or a lead id. An inbound message from anyone not already enrolled is
  * compared and dropped in memory, with no row and no log.
+ *
+ * Each event stands on its own: a write that errors on one of them must not take
+ * the rest of the delivery with it, or one D1 hiccup silently loses every
+ * message that arrived after it. The failure is a count and nothing else — the
+ * event that broke is still somebody's private message, and the error's own
+ * message quotes the value that broke it.
  */
 export async function handleProspectEvents(
   events: readonly ProspectEvent[],
   env: Env,
 ): Promise<void> {
+  let failed = 0;
+
   for (const event of events) {
-    if (event.echo) await handleEcho(event, env);
-    else await handleInbound(event, env.DB);
+    try {
+      if (event.echo) await handleEcho(event, env);
+      else await handleInbound(event, env.DB);
+    } catch {
+      failed += 1;
+    }
   }
+
+  if (failed > 0) console.log(`prospect webhook: failed=${failed}`);
 }
 
 async function handleEcho(event: ProspectEvent, env: Env): Promise<void> {

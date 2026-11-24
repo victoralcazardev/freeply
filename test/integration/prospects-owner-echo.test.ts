@@ -498,3 +498,66 @@ describe("an echo on an enrolled thread", () => {
     expect(logged).not.toContain("friend-igsid");
   });
 });
+
+/**
+ * A delivery is a batch, and one event in it can fail on its own — a write that
+ * errors, an event we cannot read. The events after it are other messages that
+ * arrived in the same second, and dropping them leaves a thread short by one.
+ */
+describe("a delivery carrying an event that fails", () => {
+  it("still applies the events that follow it", async () => {
+    const now = Date.now();
+    await enrolledLead({
+      echoAt: now - 3 * HOUR,
+      reply: "Cuéntame más",
+      replyAt: now - HOUR,
+    });
+    const before = await threadRow("lead-1");
+    const lines = captureLogs();
+
+    // The first echo carries a `text` that cannot be stored, so its write
+    // throws. The second one is an ordinary owner message in the same batch.
+    const typed = "Te contesto yo, que acabo de verlo.";
+    const at = now + 1000;
+    await deliver({
+      object: "instagram",
+      entry: [
+        {
+          id: IG_USER_ID,
+          time: at,
+          messaging: [
+            {
+              sender: { id: IG_USER_ID },
+              recipient: { id: "peer-1" },
+              timestamp: at,
+              message: { mid: "mid_unreadable", text: {}, is_echo: true },
+            },
+            {
+              sender: { id: IG_USER_ID },
+              recipient: { id: "peer-1" },
+              timestamp: at + 1,
+              message: { mid: "mid_owner_1", text: typed, is_echo: true },
+            },
+          ],
+        },
+      ],
+    });
+
+    // The second event landed, once, and the first one wrote nothing.
+    expect(await messages("lead-1")).toContainEqual({
+      mid: "mid_owner_1",
+      direction: "out",
+      origin: "owner",
+      text: typed,
+      sent_at: at + 1,
+    });
+    expect(await threadRow("lead-1")).toMatchObject({ version: before.version + 1 });
+
+    // The failure is a count and nothing else: no text, no mid, no error body.
+    const logged = lines.join("\n");
+    expect(logged).toContain("prospect webhook: failed=1");
+    expect(logged).not.toContain(typed);
+    expect(logged).not.toContain("mid_owner_1");
+    expect(logged).not.toContain("mid_unreadable");
+  });
+});
