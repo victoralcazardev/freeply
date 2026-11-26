@@ -41,13 +41,68 @@ interface ProspectWebhookPayload {
 }
 
 /**
- * The form the M1 is compared in: NFC, one space per whitespace run, trimmed.
+ * The form the exact M1 gate is compared in: NFC, one space per whitespace run,
+ * trimmed.
  *
- * Case is deliberately untouched. Two messages that differ only in case are
- * different messages, and the enrollment gate does not get to decide otherwise.
+ * Case is deliberately untouched here. This path compares hashes, and two
+ * messages that differ only in case are different messages there. The tolerant
+ * fallback is a separate, looser form — see `looseProspectText` — and only runs
+ * when this exact gate finds nothing.
  */
 export function normalizeProspectText(text: string): string {
   return text.normalize("NFC").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The form the tolerant fallback compares in: NFC, lowercase, punctuation and
+ * emoji removed, whitespace collapsed.
+ *
+ * This is deliberately looser than `normalizeProspectText`: it only runs after
+ * the exact hash found nothing, and its job is to recognise a retouched M1, not
+ * to define identity. Letters and digits survive; everything else (¡ ¿ ! ? ,
+ * . : ; « » " ' and emoji) disappears before either side is split into words.
+ */
+export function looseProspectText(text: string): string {
+  return text
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function wordDistance(a: readonly string[], b: readonly string[]): number {
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j++) {
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+
+  return previous[b.length];
+}
+
+/**
+ * How close an echo is to a copied M1, on [0, 1]: one minus the word-level
+ * Levenshtein distance over the longer of the two word counts.
+ *
+ * Word level, not character level, because the retouches are whole words
+ * (`marketing` → `publicidad`); a character metric would call unrelated short
+ * messages similar. Two texts with no words at all score 0.
+ */
+export function prospectTextSimilarity(echo: string, copied: string): number {
+  const a = looseProspectText(echo).split(" ").filter(Boolean);
+  const b = looseProspectText(copied).split(" ").filter(Boolean);
+  const longest = Math.max(a.length, b.length);
+  if (longest === 0) return 0;
+  return 1 - wordDistance(a, b) / longest;
 }
 
 export async function sha256Hex(value: string): Promise<string> {
@@ -189,8 +244,15 @@ async function handleEcho(event: ProspectEvent, env: Env): Promise<void> {
   const pending = await db.pendingM1Threads(d1, event.igUserId, sha);
 
   if (pending.length === 0) {
-    // No id, no text: a near miss is still somebody's private message.
-    console.log("prospect echo: unmatched");
+    // The exact hash is identity. Only when it finds nothing does a retouched
+    // copy get a chance, and that fallback still refuses to guess.
+    const thread = await tolerantM1Match(d1, event.igUserId, event.text);
+    if (!thread) {
+      // No id, no text: a near miss is still somebody's private message.
+      console.log("prospect echo: unmatched");
+      return;
+    }
+    await enrollM1Echo(d1, thread, event);
     return;
   }
   if (pending.length > 1) {
@@ -202,7 +264,56 @@ async function handleEcho(event: ProspectEvent, env: Env): Promise<void> {
     return;
   }
 
-  const thread = pending[0];
+  await enrollM1Echo(d1, pending[0], event);
+}
+
+/** The smallest similarity that may enroll, and the lead it needs over second. */
+const TOLERANT_M1_MIN_SIMILARITY = 0.8;
+const TOLERANT_M1_MIN_MARGIN = 0.2;
+/** Ratios land on a threshold as e.g. 0.19999999999999996; include those. */
+const TOLERANT_EPSILON = 1e-9;
+
+/**
+ * The one pending thread whose copied M1 is close enough to this echo, or null.
+ *
+ * Only reached when the exact hash found nothing, so this is a fallback for a
+ * retouched M1 — never a replacement for identity. It fails closed: the best
+ * candidate must clear the similarity floor and beat the runner-up by a wide
+ * margin, because two close leads mean the echo could belong to either and a
+ * guess would enroll the wrong person. Callers log a content-free unmatched
+ * line on null; nothing here writes, marks, or logs.
+ */
+async function tolerantM1Match(
+  d1: D1Database,
+  igUserId: string,
+  echo: string,
+): Promise<db.PendingM1Candidate | null> {
+  const candidates = await db.pendingM1Candidates(d1, igUserId);
+  let best: { thread: db.PendingM1Candidate; similarity: number } | null = null;
+  let second = 0;
+
+  for (const thread of candidates) {
+    const similarity = prospectTextSimilarity(echo, thread.m1CopiedText);
+    if (!best || similarity > best.similarity) {
+      second = best?.similarity ?? 0;
+      best = { thread, similarity };
+    } else if (similarity > second) {
+      second = similarity;
+    }
+  }
+
+  if (!best) return null;
+  if (best.similarity + TOLERANT_EPSILON < TOLERANT_M1_MIN_SIMILARITY) return null;
+  if (best.similarity - second + TOLERANT_EPSILON < TOLERANT_M1_MIN_MARGIN) return null;
+  return best.thread;
+}
+
+/** Records the M1 echo against the matched pending thread, once. */
+async function enrollM1Echo(
+  d1: D1Database,
+  thread: { leadId: string; igUserId: string; version: number },
+  event: ProspectEvent,
+): Promise<void> {
   const enrolled = await db.enrollProspectThread(d1, {
     leadId: thread.leadId,
     igUserId: thread.igUserId,

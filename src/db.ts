@@ -445,6 +445,40 @@ export async function pendingM1Threads(
   return results.map(toProspectThread);
 }
 
+/** A pending M1 plus the text that was copied, for the tolerant fallback. */
+export interface PendingM1Candidate extends ProspectThread {
+  m1CopiedText: string;
+}
+
+interface PendingM1CandidateRow extends ProspectThreadRow {
+  m1_copied_text: string;
+}
+
+/**
+ * Every pending M1 on the account with the text it was copied from.
+ *
+ * The exact matcher narrows by hash first; this is the fallback's read, so it
+ * cannot filter by text. Threads copied before `m1_copied_text` existed have
+ * nothing to compare and are left out — their hash still matches exactly.
+ */
+export async function pendingM1Candidates(
+  db: D1Database,
+  igUserId: string,
+): Promise<PendingM1Candidate[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT lead_id, ig_user_id, igsid, handle, state, m1_sha, version, m1_copied_text
+       FROM prospect_threads
+       WHERE ig_user_id = ? AND state = 'm1_pendiente'
+         AND igsid IS NULL AND m1_sha IS NOT NULL AND m1_copied_text IS NOT NULL
+       ORDER BY lead_id`,
+    )
+    .bind(igUserId)
+    .all<PendingM1CandidateRow>();
+
+  return results.map((r) => ({ ...toProspectThread(r), m1CopiedText: r.m1_copied_text }));
+}
+
 /** The enrolled thread a peer id belongs to on this account, if any. */
 export async function enrolledThreadByIgsid(
   db: D1Database,

@@ -150,9 +150,9 @@ async function seedThread(over: ThreadSeed = {}) {
   await env.DB.prepare(
     `INSERT INTO prospect_threads
        (lead_id, ig_user_id, igsid, handle, name, nicho, state, m1_sha,
-        m1_registered_at, version, last_inbound_at, last_outbound_at,
-        created_at, updated_at)
-     VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+        m1_copied_text, m1_registered_at, version, last_inbound_at,
+        last_outbound_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
   )
     .bind(
       leadId,
@@ -161,6 +161,7 @@ async function seedThread(over: ThreadSeed = {}) {
       over.handle ?? "lead.handle",
       state,
       await textSha(over.m1 ?? "Hola, soy Víctor."),
+      over.m1 ?? "Hola, soy Víctor.",
       state === "m1_pendiente" ? now : null,
       over.version ?? (state === "enrolled" ? 1 : 0),
       state === "enrolled" ? now : null,
@@ -349,6 +350,204 @@ describe("M1 echo enrollment", () => {
     expect(await messages()).toEqual([]);
     expect(lines).toContain("prospect echo: ambiguous pending=2");
     expectNoSecrets(lines, [m1, mid, "lead-a", "lead-b", "a.handle", "b.handle"]);
+  });
+
+  /**
+   * The operator retouches the M1 on the phone before sending it: drops the
+   * opening «¡» and swaps a word. The exact hash no longer sees it, but the
+   * copied text is close enough to name the one thread it belongs to.
+   */
+  it("enrolls the right thread when the echo only resembles the copied M1", async () => {
+    const m1 =
+      "¡Hola! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    const sent =
+      "Hola! Soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-target", handle: "target.handle", m1 });
+    await seedThread({
+      leadId: "lead-other",
+      handle: "other.handle",
+      m1: "Hola, soy Víctor. Vi tu perfil y me gustó tu contenido.",
+    });
+    const lines = captureLogs();
+
+    const mid = "mid_retouched";
+    const peer = "peer-retouched";
+    await post(echo({ text: sent, mid, peerId: peer }));
+
+    expect(await thread("lead-target")).toMatchObject({
+      igsid: peer,
+      state: "enrolled",
+      version: 1,
+    });
+    expect(await thread("lead-other")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect(await messages()).toEqual([
+      {
+        mid,
+        leadId: "lead-target",
+        direction: "out",
+        origin: "echo_m1",
+        text: sent,
+        sentAt: ECHO_AT,
+      },
+    ]);
+    expect(lines).toContain("prospect echo: enrolled");
+    expectNoSecrets(lines, [
+      m1,
+      sent,
+      mid,
+      peer,
+      "lead-target",
+      "target.handle",
+      "lead-other",
+      "other.handle",
+    ]);
+  });
+
+  /**
+   * The exact hash keeps priority. A pending thread with a similar text is not
+   * consulted while one thread matches exactly, and stays untouched.
+   */
+  it("keeps the exact match ahead of a close pending M1", async () => {
+    const exact = "Hola, soy Víctor. Vi que llevas una agencia de marketing.";
+    const near = "Hola, soy Víctor. Vi que llevas una agencia de publicidad.";
+    await seedThread({ leadId: "lead-exact", handle: "exact.handle", m1: exact });
+    await seedThread({ leadId: "lead-near", handle: "near.handle", m1: near });
+
+    const mid = "mid_exact";
+    await post(echo({ text: exact, mid, peerId: "peer-exact" }));
+
+    expect(await thread("lead-exact")).toMatchObject({
+      igsid: "peer-exact",
+      state: "enrolled",
+      version: 1,
+    });
+    expect(await thread("lead-near")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect((await messages()).map((m) => m.mid)).toEqual([mid]);
+  });
+
+  /**
+   * Two copied M1s can both be close to the echo. Close is not evidence of
+   * which lead received it, so neither enrolls, neither is marked, and the log
+   * stays the content-free unmatched line.
+   */
+  it("enrolls neither and marks nothing when two pending M1s are both close", async () => {
+    const m1a =
+      "¡Hola! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    const m1b =
+      "¡Hola! Soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+    const sent =
+      "Hola! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-a", handle: "a.handle", m1: m1a });
+    await seedThread({ leadId: "lead-b", handle: "b.handle", m1: m1b });
+    const lines = captureLogs();
+
+    const mid = "mid_two_close";
+    await post(echo({ text: sent, mid, peerId: "peer-two-close" }));
+
+    for (const leadId of ["lead-a", "lead-b"]) {
+      expect(await thread(leadId)).toMatchObject({
+        igsid: null,
+        state: "m1_pendiente",
+        version: 0,
+      });
+    }
+    expect(await messages()).toEqual([]);
+    expect(lines).toContain("prospect echo: unmatched");
+    expect(lines.some((line) => line.includes("ambiguous"))).toBe(false);
+    expectNoSecrets(lines, [m1a, m1b, sent, mid, "lead-a", "lead-b", "a.handle", "b.handle"]);
+  });
+
+  /**
+   * The similarity floor is inclusive: one changed word in five sits exactly on
+   * 0.8 and enrolls, while the same change in four (0.75) does not.
+   */
+  it("enrolls at the similarity floor and refuses just below it", async () => {
+    await seedThread({
+      leadId: "lead-floor",
+      handle: "floor.handle",
+      m1: "Hola soy Víctor de Madrid",
+    });
+
+    await post(
+      echo({
+        text: "Hola soy Víctor de Barcelona",
+        mid: "mid_floor",
+        peerId: "peer-floor",
+      }),
+    );
+    expect(await thread("lead-floor")).toMatchObject({
+      igsid: "peer-floor",
+      state: "enrolled",
+      version: 1,
+    });
+
+    await seedThread({
+      leadId: "lead-below",
+      handle: "below.handle",
+      m1: "Hola soy Víctor Madrid",
+    });
+    const lines = captureLogs();
+    await post(
+      echo({
+        text: "Hola soy Víctor Barcelona",
+        mid: "mid_below",
+        peerId: "peer-below",
+      }),
+    );
+
+    expect(await thread("lead-below")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect((await messages()).map((m) => m.mid)).toEqual(["mid_floor"]);
+    expect(lines).toContain("prospect echo: unmatched");
+  });
+
+  /**
+   * An echo on an enrolled thread is the operator talking to that lead. It must
+   * never fall through to the tolerant matcher, even when it resembles another
+   * lead's copied M1.
+   */
+  it("keeps an enrolled echo on the owner path even when it resembles a pending M1", async () => {
+    const pendingM1 = "Hola, soy Víctor. Vi que llevas una agencia de marketing.";
+    const typed = "Hola, soy Víctor. Vi que llevas una agencia de publicidad.";
+    await seedThread({
+      leadId: "lead-enrolled",
+      handle: "enrolled.handle",
+      state: "enrolled",
+      igsid: "peer-enrolled",
+      version: 1,
+      m1: "Hola, soy Víctor. Vi tus fotos.",
+    });
+    await seedThread({ leadId: "lead-pending", handle: "pending.handle", m1: pendingM1 });
+
+    const mid = "mid_owner";
+    await post(echo({ text: typed, mid, peerId: "peer-enrolled" }));
+
+    expect(await thread("lead-pending")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect(await messages()).toEqual([
+      {
+        mid,
+        leadId: "lead-enrolled",
+        direction: "out",
+        origin: "owner",
+        text: typed,
+        sentAt: ECHO_AT,
+      },
+    ]);
   });
 });
 
