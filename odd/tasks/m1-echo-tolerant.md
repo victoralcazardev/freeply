@@ -18,3 +18,4 @@ The operator sometimes retouches the M1 in Instagram after copying it on `/prosp
 
 - L1 (2026-11-26, Víctor): «También estoy viendo que escribimos demasiado formal, por ejemplo la exclamación inicial o la pregunta de interrogación inicial, casi nadie la escribe, así que vamos a empezar a no usarlas tanto, o al menos si yo modifico un poco el mensaje, que no te dé problemas para interpretar que a esa persona se le ha respondido, que a veces retoco algunas cosas.»
 - L2 (2026-11-26, Víctor): deploy authorised once tests pass («Sí, despliega»); the parent deploys, not the worker.
+- L3: review JD-A-001, JD-B-001, JD-B-002 fixed: name word required, uncomparable armed thread blocks, length prefilter + 20-candidate cap

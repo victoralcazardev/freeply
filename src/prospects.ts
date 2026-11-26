@@ -71,6 +71,32 @@ export function looseProspectText(text: string): string {
     .trim();
 }
 
+/** Words of a text, in the loose form the tolerant fallback compares in. */
+function looseWords(text: string): string[] {
+  return looseProspectText(text).split(" ").filter(Boolean);
+}
+
+/** Titles that live inside a stored name and never identify the person. */
+const PROSPECT_NAME_TITLES = new Set(["dr", "dra", "doctor", "doctora"]);
+
+/**
+ * The words of a lead's name a message can use to name them.
+ *
+ * Titles are dropped, and so is anything shorter than three letters: «de», «la»
+ * and a stray initial say nothing about who this is. An empty result means the
+ * stored name cannot identify anybody, which is a lead the tolerant fallback
+ * must leave alone rather than match on resemblance.
+ */
+export function prospectNameWords(name: string | null | undefined): string[] {
+  return name
+    ? looseWords(name).filter(
+        (word) =>
+          !PROSPECT_NAME_TITLES.has(word) &&
+          (word.match(/\p{L}/gu)?.length ?? 0) >= 3,
+      )
+    : [];
+}
+
 function wordDistance(a: readonly string[], b: readonly string[]): number {
   let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
 
@@ -98,8 +124,8 @@ function wordDistance(a: readonly string[], b: readonly string[]): number {
  * messages similar. Two texts with no words at all score 0.
  */
 export function prospectTextSimilarity(echo: string, copied: string): number {
-  const a = looseProspectText(echo).split(" ").filter(Boolean);
-  const b = looseProspectText(copied).split(" ").filter(Boolean);
+  const a = looseWords(echo);
+  const b = looseWords(copied);
   const longest = Math.max(a.length, b.length);
   if (longest === 0) return 0;
   return 1 - wordDistance(a, b) / longest;
@@ -272,16 +298,29 @@ const TOLERANT_M1_MIN_SIMILARITY = 0.8;
 const TOLERANT_M1_MIN_MARGIN = 0.2;
 /** Ratios land on a threshold as e.g. 0.19999999999999996; include those. */
 const TOLERANT_EPSILON = 1e-9;
+/**
+ * A word-count ratio below the floor cannot reach it, so those candidates are
+ * skipped before any distance is computed.
+ */
+const TOLERANT_M1_MIN_LENGTH_RATIO = TOLERANT_M1_MIN_SIMILARITY;
+/**
+ * Past this many comparable leads, resembling the M1 stops being evidence: the
+ * operator could have sent it to any of them. The Worker gives up instead of
+ * spending CPU on a guess.
+ */
+const TOLERANT_M1_MAX_CANDIDATES = 20;
 
 /**
  * The one pending thread whose copied M1 is close enough to this echo, or null.
  *
  * Only reached when the exact hash found nothing, so this is a fallback for a
- * retouched M1 — never a replacement for identity. It fails closed: the best
- * candidate must clear the similarity floor and beat the runner-up by a wide
- * margin, because two close leads mean the echo could belong to either and a
- * guess would enroll the wrong person. Callers log a content-free unmatched
- * line on null; nothing here writes, marks, or logs.
+ * retouched M1 — never a replacement for identity. It fails closed several
+ * ways: the echo must say the lead's name, a thread that cannot be compared
+ * blocks the whole read, too many candidates is no answer at all, and the best
+ * must clear the similarity floor and beat the runner-up by a wide margin,
+ * because two close leads mean the echo could belong to either and a guess
+ * would enroll the wrong person. Callers log a content-free unmatched line on
+ * null; nothing here writes, marks, or logs.
  */
 async function tolerantM1Match(
   d1: D1Database,
@@ -289,16 +328,49 @@ async function tolerantM1Match(
   echo: string,
 ): Promise<db.PendingM1Candidate | null> {
   const candidates = await db.pendingM1Candidates(d1, igUserId);
-  let best: { thread: db.PendingM1Candidate; similarity: number } | null = null;
+  const echoWords = looseWords(echo);
+  const echoed = new Set(echoWords);
+  const comparable: { thread: db.PendingM1Candidate; copied: string }[] = [];
   let second = 0;
 
   for (const thread of candidates) {
-    const similarity = prospectTextSimilarity(echo, thread.m1CopiedText);
+    const copied = thread.m1CopiedText;
+    // A thread armed before the text was stored has nothing to compare, and
+    // nothing rules it out as the lead this echo belongs to. Enrolling a
+    // different one would be a guess about identity, so the fallback declines.
+    if (copied === null) return null;
+
+    // The name is what turns resemblance into a match: the same template with
+    // somebody else's name is a message to that somebody else, and similarity
+    // alone would enroll this lead for it. A lead with no usable name cannot
+    // be identified this way at all.
+    if (!prospectNameWords(thread.name).some((word) => echoed.has(word))) continue;
+
+    // The distance is at least the length difference, so a candidate this far
+    // off cannot reach the floor and is skipped without a comparison.
+    const copiedWords = looseWords(copied).length;
+    const longest = Math.max(copiedWords, echoWords.length);
+    const ratio = longest === 0 ? 0 : Math.min(copiedWords, echoWords.length) / longest;
+    if (ratio < TOLERANT_M1_MIN_LENGTH_RATIO) {
+      // Its own bound still counts as a runner-up: a lead this close could be
+      // the second one the margin exists to rule out, and pretending it was
+      // never there would enroll where the full comparison would have refused.
+      second = Math.max(second, ratio);
+      continue;
+    }
+
+    if (comparable.length >= TOLERANT_M1_MAX_CANDIDATES) return null;
+    comparable.push({ thread, copied });
+  }
+
+  let best: { thread: db.PendingM1Candidate; similarity: number } | null = null;
+  for (const candidate of comparable) {
+    const similarity = prospectTextSimilarity(echo, candidate.copied);
     if (!best || similarity > best.similarity) {
-      second = best?.similarity ?? 0;
-      best = { thread, similarity };
-    } else if (similarity > second) {
-      second = similarity;
+      second = Math.max(second, best?.similarity ?? 0);
+      best = { thread: candidate.thread, similarity };
+    } else {
+      second = Math.max(second, similarity);
     }
   }
 

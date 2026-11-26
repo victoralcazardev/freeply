@@ -138,37 +138,56 @@ interface ThreadSeed {
   igUserId?: string;
   igsid?: string | null;
   handle?: string;
+  name?: string | null;
   state?: "m1_pendiente" | "enrolled";
   m1?: string;
+  /** `null` seeds an armed thread that predates the copied text (JD-B-002). */
+  m1CopiedText?: string | null;
   version?: number;
 }
 
-async function seedThread(over: ThreadSeed = {}) {
-  const leadId = over.leadId ?? "lead-1";
+const DEFAULT_M1 = "Hola, soy Víctor.";
+
+async function threadStatement(over: ThreadSeed) {
   const state = over.state ?? "m1_pendiente";
   const now = Date.now();
-  await env.DB.prepare(
+  const m1 = over.m1 ?? DEFAULT_M1;
+  return env.DB.prepare(
     `INSERT INTO prospect_threads
        (lead_id, ig_user_id, igsid, handle, name, nicho, state, m1_sha,
         m1_copied_text, m1_registered_at, version, last_inbound_at,
         last_outbound_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-  )
-    .bind(
-      leadId,
-      over.igUserId ?? IG_USER_ID,
-      over.igsid ?? null,
-      over.handle ?? "lead.handle",
-      state,
-      await textSha(over.m1 ?? "Hola, soy Víctor."),
-      over.m1 ?? "Hola, soy Víctor.",
-      state === "m1_pendiente" ? now : null,
-      over.version ?? (state === "enrolled" ? 1 : 0),
-      state === "enrolled" ? now : null,
-      now,
-      now,
-    )
-    .run();
+     VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+  ).bind(
+    over.leadId ?? "lead-1",
+    over.igUserId ?? IG_USER_ID,
+    over.igsid ?? null,
+    over.handle ?? "lead.handle",
+    over.name ?? null,
+    state,
+    await textSha(m1),
+    over.m1CopiedText === undefined ? m1 : over.m1CopiedText,
+    state === "m1_pendiente" ? now : null,
+    over.version ?? (state === "enrolled" ? 1 : 0),
+    state === "enrolled" ? now : null,
+    now,
+    now,
+  );
+}
+
+async function seedThread(over: ThreadSeed = {}) {
+  await (await threadStatement(over)).run();
+}
+
+/**
+ * Seeds many threads in a few round trips: the work-bound tests need hundreds
+ * of rows, and one await each would cost more than the assertion.
+ */
+async function seedThreads(seeds: ThreadSeed[]) {
+  const statements = await Promise.all(seeds.map(threadStatement));
+  for (let i = 0; i < statements.length; i += 100) {
+    await env.DB.batch(statements.slice(i, i + 100));
+  }
 }
 
 interface ThreadRow {
@@ -359,14 +378,15 @@ describe("M1 echo enrollment", () => {
    */
   it("enrolls the right thread when the echo only resembles the copied M1", async () => {
     const m1 =
-      "¡Hola! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+      "¡Hola, Marta! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
     const sent =
-      "Hola! Soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
-    await seedThread({ leadId: "lead-target", handle: "target.handle", m1 });
+      "Hola, Marta! Soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-target", handle: "target.handle", name: "Marta", m1 });
     await seedThread({
       leadId: "lead-other",
       handle: "other.handle",
-      m1: "Hola, soy Víctor. Vi tu perfil y me gustó tu contenido.",
+      name: "Marta Sánchez",
+      m1: "Hola, Marta. Soy Víctor. Vi tu perfil y me gustó tu contenido.",
     });
     const lines = captureLogs();
 
@@ -440,13 +460,13 @@ describe("M1 echo enrollment", () => {
    */
   it("enrolls neither and marks nothing when two pending M1s are both close", async () => {
     const m1a =
-      "¡Hola! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+      "¡Hola, Marta! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
     const m1b =
-      "¡Hola! Soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+      "¡Hola, Marta! Soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
     const sent =
-      "Hola! Soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
-    await seedThread({ leadId: "lead-a", handle: "a.handle", m1: m1a });
-    await seedThread({ leadId: "lead-b", handle: "b.handle", m1: m1b });
+      "Hola, Marta! Soy Víctor. Vi que llevas una agencia de diseño y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-a", handle: "a.handle", name: "Marta", m1: m1a });
+    await seedThread({ leadId: "lead-b", handle: "b.handle", name: "Marta", m1: m1b });
     const lines = captureLogs();
 
     const mid = "mid_two_close";
@@ -473,12 +493,13 @@ describe("M1 echo enrollment", () => {
     await seedThread({
       leadId: "lead-floor",
       handle: "floor.handle",
-      m1: "Hola soy Víctor de Madrid",
+      name: "Marta",
+      m1: "Marta soy Víctor de Madrid",
     });
 
     await post(
       echo({
-        text: "Hola soy Víctor de Barcelona",
+        text: "Marta soy Víctor de Barcelona",
         mid: "mid_floor",
         peerId: "peer-floor",
       }),
@@ -492,12 +513,13 @@ describe("M1 echo enrollment", () => {
     await seedThread({
       leadId: "lead-below",
       handle: "below.handle",
-      m1: "Hola soy Víctor Madrid",
+      name: "Marta",
+      m1: "Marta soy Víctor Madrid",
     });
     const lines = captureLogs();
     await post(
       echo({
-        text: "Hola soy Víctor Barcelona",
+        text: "Marta soy Víctor Barcelona",
         mid: "mid_below",
         peerId: "peer-below",
       }),
@@ -510,6 +532,284 @@ describe("M1 echo enrollment", () => {
     });
     expect((await messages()).map((m) => m.mid)).toEqual(["mid_floor"]);
     expect(lines).toContain("prospect echo: unmatched");
+  });
+
+  /**
+   * The operator writes to somebody who never came from /prospects, reusing the
+   * M1 template with that person's name. With a single pending lead the
+   * runner-up is 0, so the margin always passes and similarity alone would
+   * enroll a lead who was never messaged. The name is the evidence that this
+   * message was for somebody else.
+   */
+  it("enrolls nothing when the retouched M1 names somebody else", async () => {
+    const m1 =
+      "Hola Marta, soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    const typed =
+      "Hola Lucía, soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-marta", handle: "marta.handle", name: "Marta Ruiz", m1 });
+    const lines = captureLogs();
+
+    const mid = "mid_other_name";
+    const peer = "peer-not-a-lead";
+    await post(echo({ text: typed, mid, peerId: peer }));
+
+    expect(await thread("lead-marta")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect(await messages()).toEqual([]);
+    expect(lines).toContain("prospect echo: unmatched");
+    expectNoSecrets(lines, [m1, typed, mid, peer, "lead-marta", "marta.handle", "Marta", "Lucía"]);
+  });
+
+  /**
+   * A title is part of how the name was stored, not part of how the person is
+   * addressed: a lead saved as «Dra. Marta Ruiz» is named by an echo that only
+   * says «Marta».
+   */
+  it("recognises a lead whose name is stored with a title", async () => {
+    const m1 =
+      "Hola Marta, soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    const sent =
+      "Hola Marta, soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-title", name: "Dra. Marta Ruiz", m1 });
+
+    await post(echo({ text: sent, mid: "mid_title", peerId: "peer-title" }));
+
+    expect(await thread("lead-title")).toMatchObject({
+      igsid: "peer-title",
+      state: "enrolled",
+      version: 1,
+    });
+  });
+
+  /**
+   * A lead nobody named cannot be named by any message, so the tolerant
+   * fallback has no way to tell their M1 from a template that was sent to
+   * somebody else. They stay out of the comparison instead.
+   */
+  it("leaves a lead with no stored name out of the tolerant fallback", async () => {
+    const m1 =
+      "Hola, soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    const sent =
+      "Hola, soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-nameless", name: null, m1 });
+    const lines = captureLogs();
+
+    await post(echo({ text: sent, mid: "mid_nameless", peerId: "peer-nameless" }));
+
+    expect(await thread("lead-nameless")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect(await messages()).toEqual([]);
+    expect(lines).toContain("prospect echo: unmatched");
+  });
+
+  /** A name of titles and particles names nobody either. */
+  it("leaves a lead whose name is only a title out of the tolerant fallback", async () => {
+    const m1 =
+      "Hola, soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    const sent =
+      "Hola, soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-title-only", name: "Dra.", m1 });
+
+    await post(echo({ text: sent, mid: "mid_title_only", peerId: "peer-title-only" }));
+
+    expect(await thread("lead-title-only")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect(await messages()).toEqual([]);
+  });
+
+  /**
+   * A thread armed before `m1_copied_text` existed has nothing to compare, so
+   * it cannot be ruled out as the lead who received this echo. Enrolling
+   * another one would be a guess about identity: the fallback refuses.
+   */
+  it("enrolls nothing when an armed pending thread has no copied text", async () => {
+    const m1 =
+      "Hola Marta, soy Víctor. Vi que llevas una agencia de marketing y quería saber si te encaja una llamada.";
+    const sent =
+      "Hola Marta, soy Víctor. Vi que llevas una agencia de publicidad y quería saber si te encaja una llamada.";
+    await seedThread({ leadId: "lead-target", name: "Marta", m1 });
+    await seedThread({
+      leadId: "lead-armed",
+      handle: "armed.handle",
+      name: "Remedios",
+      m1: "Hola Remedios, soy Víctor. Una cosa completamente distinta que no se parece a la de arriba.",
+      m1CopiedText: null,
+    });
+    const lines = captureLogs();
+
+    await post(echo({ text: sent, mid: "mid_armed", peerId: "peer-armed" }));
+
+    expect(await thread("lead-target")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect(await thread("lead-armed")).toMatchObject({ igsid: null, version: 0 });
+    expect(await messages()).toEqual([]);
+    expect(lines).toContain("prospect echo: unmatched");
+  });
+
+  /**
+   * Only a lead whose name the echo says can be a candidate, so hundreds of
+   * unrelated pending leads cost a name comparison each and never reach a
+   * distance or the candidate cap. If they were compared, the cap would refuse
+   * the echo and the one real match would be lost.
+   */
+  it("enrolls the one lead the echo names among five hundred pending leads", async () => {
+    const echoWords = [
+      "hola", "marta", "soy", "victor", "vi", "que", "llevas", "una", "agencia", "de", "publicidad",
+    ];
+    const echoText = echoWords.join(" ");
+    const targetM1 = [...echoWords.slice(0, -1), "marketing"].join(" ");
+
+    await seedThread({
+      leadId: "lead-target",
+      handle: "target.handle",
+      name: "Marta",
+      m1: targetM1,
+    });
+    await seedThreads(
+      Array.from({ length: 500 }, (_, i) => ({
+        leadId: `lead-bulk-${i}`,
+        handle: `bulk${i}.handle`,
+        name: `Persona${i} Apellido${i}`,
+        m1: `Hola, soy Víctor. ${Array.from(
+          { length: 30 },
+          (_, k) => `palabra${i}x${k}`,
+        ).join(" ")}`,
+      })),
+    );
+
+    const pending = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM prospect_threads
+       WHERE ig_user_id = ? AND state = 'm1_pendiente'`,
+    )
+      .bind(IG_USER_ID)
+      .first<{ n: number }>();
+    expect(pending?.n).toBe(501);
+
+    const lines = captureLogs();
+    await post(echo({ text: echoText, mid: "mid_many", peerId: "peer-many" }));
+
+    expect(await thread("lead-target")).toMatchObject({
+      igsid: "peer-many",
+      state: "enrolled",
+      version: 1,
+    });
+    expect(await messages()).toEqual([
+      {
+        mid: "mid_many",
+        leadId: "lead-target",
+        direction: "out",
+        origin: "echo_m1",
+        text: echoText,
+        sentAt: ECHO_AT,
+      },
+    ]);
+    expect(lines).toContain("prospect echo: enrolled");
+  });
+
+  /**
+   * A copied text whose word count is more than 20% off cannot reach the
+   * similarity floor — the distance is at least the length difference — so it
+   * is dropped before any comparison, and before the cap counts it.
+   */
+  it("skips candidates whose copied text is far shorter than the echo", async () => {
+    const echoText = "hola marta soy victor vi que llevas una agencia de publicidad";
+    await seedThread({
+      leadId: "lead-len-target",
+      handle: "len-target.handle",
+      name: "Marta",
+      m1: "hola marta soy victor vi que llevas una agencia de marketing",
+    });
+    await seedThreads(
+      Array.from({ length: 25 }, (_, i) => ({
+        leadId: `lead-short-${i}`,
+        handle: `short${i}.handle`,
+        name: "Marta",
+        m1: "Hola.",
+      })),
+    );
+
+    await post(echo({ text: echoText, mid: "mid_short", peerId: "peer-short" }));
+
+    expect(await thread("lead-len-target")).toMatchObject({
+      igsid: "peer-short",
+      state: "enrolled",
+      version: 1,
+    });
+  });
+
+  /**
+   * Past twenty comparable leads, resembling the M1 stops being evidence: the
+   * operator could have sent it to any of them. The fallback refuses rather
+   * than spend the CPU on a guess.
+   */
+  it("enrolls nothing when more than twenty comparable leads are pending", async () => {
+    const echoWords = [
+      "hola", "marta", "soy", "victor", "vi", "que", "llevas", "una", "agencia", "de", "publicidad",
+    ];
+    const echoText = echoWords.join(" ");
+    await seedThread({
+      leadId: "lead-cap-target",
+      name: "Marta",
+      m1: [...echoWords.slice(0, -1), "marketing"].join(" "),
+    });
+    await seedThreads(
+      Array.from({ length: 21 }, (_, i) => ({
+        leadId: `lead-cap-${i}`,
+        name: "Marta",
+        m1: ["hola", "marta", "soy", ...Array.from({ length: 8 }, (_, k) => `z${i}x${k}`)].join(" "),
+      })),
+    );
+    const lines = captureLogs();
+
+    await post(echo({ text: echoText, mid: "mid_cap", peerId: "peer-cap" }));
+
+    expect(await thread("lead-cap-target")).toMatchObject({
+      igsid: null,
+      state: "m1_pendiente",
+      version: 0,
+    });
+    expect(await messages()).toEqual([]);
+    expect(lines).toContain("prospect echo: unmatched");
+  });
+
+  /** The cap includes the twentieth: twenty comparable leads still get an answer. */
+  it("enrolls the best of exactly twenty comparable leads", async () => {
+    const echoWords = [
+      "hola", "marta", "soy", "victor", "vi", "que", "llevas", "una", "agencia", "de", "publicidad",
+    ];
+    const echoText = echoWords.join(" ");
+    await seedThread({
+      leadId: "lead-twenty-target",
+      name: "Marta",
+      m1: [...echoWords.slice(0, -1), "marketing"].join(" "),
+    });
+    await seedThreads(
+      Array.from({ length: 19 }, (_, i) => ({
+        leadId: `lead-twenty-${i}`,
+        name: "Marta",
+        m1: ["hola", "marta", "soy", ...Array.from({ length: 8 }, (_, k) => `y${i}x${k}`)].join(" "),
+      })),
+    );
+
+    await post(echo({ text: echoText, mid: "mid_twenty", peerId: "peer-twenty" }));
+
+    expect(await thread("lead-twenty-target")).toMatchObject({
+      igsid: "peer-twenty",
+      state: "enrolled",
+      version: 1,
+    });
   });
 
   /**

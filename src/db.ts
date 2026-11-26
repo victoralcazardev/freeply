@@ -445,21 +445,28 @@ export async function pendingM1Threads(
   return results.map(toProspectThread);
 }
 
-/** A pending M1 plus the text that was copied, for the tolerant fallback. */
+/** A pending M1 plus what the tolerant fallback needs to compare it. */
 export interface PendingM1Candidate extends ProspectThread {
-  m1CopiedText: string;
+  /** Null when the thread was armed before the copied text was stored. */
+  m1CopiedText: string | null;
+  /** The lead's name as `prospects` holds it; null when nobody recorded one. */
+  name: string | null;
 }
 
 interface PendingM1CandidateRow extends ProspectThreadRow {
-  m1_copied_text: string;
+  m1_copied_text: string | null;
+  name: string | null;
 }
 
 /**
- * Every pending M1 on the account with the text it was copied from.
+ * Every armed pending M1 on the account, with the text it was copied from and
+ * the lead's name.
  *
  * The exact matcher narrows by hash first; this is the fallback's read, so it
- * cannot filter by text. Threads copied before `m1_copied_text` existed have
- * nothing to compare and are left out — their hash still matches exactly.
+ * cannot filter by text. A thread copied before `m1_copied_text` existed is
+ * returned with null rather than left out: the fallback has to know that thread
+ * cannot be compared before it can refuse to guess past it. Its hash still
+ * matches exactly, which is unaffected by this read.
  */
 export async function pendingM1Candidates(
   db: D1Database,
@@ -467,16 +474,21 @@ export async function pendingM1Candidates(
 ): Promise<PendingM1Candidate[]> {
   const { results } = await db
     .prepare(
-      `SELECT lead_id, ig_user_id, igsid, handle, state, m1_sha, version, m1_copied_text
+      `SELECT lead_id, ig_user_id, igsid, handle, name, state, m1_sha, version,
+              m1_copied_text
        FROM prospect_threads
        WHERE ig_user_id = ? AND state = 'm1_pendiente'
-         AND igsid IS NULL AND m1_sha IS NOT NULL AND m1_copied_text IS NOT NULL
+         AND igsid IS NULL AND m1_sha IS NOT NULL
        ORDER BY lead_id`,
     )
     .bind(igUserId)
     .all<PendingM1CandidateRow>();
 
-  return results.map((r) => ({ ...toProspectThread(r), m1CopiedText: r.m1_copied_text }));
+  return results.map((r) => ({
+    ...toProspectThread(r),
+    name: r.name,
+    m1CopiedText: r.m1_copied_text,
+  }));
 }
 
 /** The enrolled thread a peer id belongs to on this account, if any. */
